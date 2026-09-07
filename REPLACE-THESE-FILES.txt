@@ -1,0 +1,16 @@
+PipePin 0.3 update
+
+Replace these in your GitHub repository:
+
+PipePinAR/ARSessionController.swift
+PipePinAR/ContentView.swift
+PipePinAR/Marker.swift
+project.yml
+.github/workflows/build-unsigned-ipa.yml
+
+The other Swift files are unchanged but are included in the ZIP so the folder is a complete build.
+
+After commit:
+Actions -> Build PipePin iPhone IPA -> Run workflow
+Artifact: PipePinAR-0.3-iPhone-build
+IPA: PipePinAR-0.3-unsigned.ipa

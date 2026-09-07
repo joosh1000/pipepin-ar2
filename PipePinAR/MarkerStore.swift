@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 @MainActor
 final class MarkerStore: ObservableObject {
@@ -21,9 +22,9 @@ final class MarkerStore: ObservableObject {
     }
 
     func delete(at offsets: IndexSet) {
-        let deleted = offsets.map { markers[$0].id }
+        let ids = offsets.map { markers[$0].id }
         markers.remove(atOffsets: offsets)
-        if let selectedMarkerID, deleted.contains(selectedMarkerID) {
+        if let selectedMarkerID, ids.contains(selectedMarkerID) {
             self.selectedMarkerID = markers.last?.id
         }
         save()
@@ -35,12 +36,6 @@ final class MarkerStore: ObservableObject {
         if selectedMarkerID == last.id {
             selectedMarkerID = markers.last?.id
         }
-        save()
-    }
-
-    func clear() {
-        markers.removeAll()
-        selectedMarkerID = nil
         save()
     }
 
