@@ -24,7 +24,16 @@ final class MarkerStore: ObservableObject {
         let deleted = offsets.map { markers[$0].id }
         markers.remove(atOffsets: offsets)
         if let selectedMarkerID, deleted.contains(selectedMarkerID) {
-            self.selectedMarkerID = markers.first?.id
+            self.selectedMarkerID = markers.last?.id
+        }
+        save()
+    }
+
+    func deleteLast() {
+        guard let last = markers.last else { return }
+        markers.removeLast()
+        if selectedMarkerID == last.id {
+            selectedMarkerID = markers.last?.id
         }
         save()
     }
@@ -45,6 +54,6 @@ final class MarkerStore: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([SavedMarker].self, from: data) else { return }
         markers = decoded
-        selectedMarkerID = decoded.first?.id
+        selectedMarkerID = decoded.last?.id
     }
 }

@@ -1,0 +1,15 @@
+PIPEPIN 0.2 - UPDATE YOUR EXISTING GITHUB REPO
+
+1. Extract this ZIP on Windows.
+2. Open your existing GitHub repo: pipepin-ar
+3. Add file -> Upload files.
+4. Drag the CONTENTS of this extracted folder into the upload area (not the ZIP itself).
+5. GitHub should show the existing Swift files as changed/replaced plus the workflow/project files.
+6. Commit message: PipePin 0.2 LiDAR and service types
+7. Click Commit changes.
+8. Go to Actions -> Build PipePin iPhone IPA -> Run workflow.
+9. Wait for green tick.
+10. Download artifact: PipePinAR-0.2-iPhone-build
+11. Extract PipePinAR-0.2-unsigned.ipa and install with Sideloadly exactly as before.
+
+If GitHub refuses to replace a file in web upload, open that file in GitHub, choose Edit, or delete the old file and upload the new one. Usually drag/upload will replace it automatically when paths match.
