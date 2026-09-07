@@ -6,7 +6,7 @@ import SwiftUI
 final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     weak var arView: ARView?
 
-    @Published var statusText = "Move the phone slowly to map the room."
+    @Published var statusText = "Move slowly while PipePin maps the space."
     @Published var trackingText = "Starting AR…"
     @Published var currentPosition: SIMD3<Float> = .zero
     @Published var horizontalDistance: Float?
@@ -14,10 +14,12 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lidarAvailable = false
     @Published var lidarMeshVisible = false
     @Published var mappedSurfaceCount = 0
+    @Published var verticalBeamLength: Float = 12.0
 
     var markerStore: MarkerStore?
     private var markerEntities: [UUID: AnchorEntity] = [:]
     private var guideEntity: AnchorEntity?
+    private var guideMarkerID: UUID?
 
     var lidarStatusText: String {
         lidarAvailable ? "LiDAR active" : "AR tracking"
@@ -48,9 +50,9 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         arView.session.run(config, options: options)
 
         if lidarAvailable {
-            statusText = "LiDAR mapping active. Aim the crosshair and mark a service."
+            statusText = "LiDAR mapping active · aim at a service and pin it."
         } else {
-            statusText = "Aim the crosshair at a visible surface and mark a service."
+            statusText = "World tracking active · aim at a visible surface and pin it."
         }
 
         rebuildMarkerEntities()
@@ -67,7 +69,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
         let results = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any)
         guard let hit = results.first else {
-            statusText = "No surface found. Scan the area slowly and try again."
+            statusText = "No surface found · scan the area slowly and try again."
             return
         }
 
@@ -83,7 +85,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         markerStore.add(marker)
         addMarkerEntity(marker)
         selectMarker(marker)
-        statusText = "Pinned \(marker.name). Keep PipePin open while moving through the building."
+        statusText = "\(marker.name) pinned · vertical locator beam is live."
     }
 
     func undoLastMarker() {
@@ -110,6 +112,12 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         updateGuide()
     }
 
+    func setBeamLength(_ length: Float) {
+        verticalBeamLength = min(max(length, 4.0), 20.0)
+        rebuildMarkerEntities()
+        statusText = "Locator beams set to \(Int(verticalBeamLength)) m."
+    }
+
     func toggleLiDARMesh() {
         guard let arView else { return }
         guard lidarAvailable else {
@@ -125,23 +133,71 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         }
     }
 
+    private func solidMaterial(for serviceType: ServiceType) -> SimpleMaterial {
+        SimpleMaterial(
+            color: serviceType.uiColor,
+            roughness: 0.18,
+            isMetallic: false
+        )
+    }
+
+    private func glowMaterial(for serviceType: ServiceType) -> SimpleMaterial {
+        SimpleMaterial(
+            color: serviceType.uiColor.withAlphaComponent(0.22),
+            roughness: 0.10,
+            isMetallic: false
+        )
+    }
+
     private func addMarkerEntity(_ marker: SavedMarker) {
         guard let arView else { return }
 
         let anchor = AnchorEntity(world: marker.position)
-        let sphere = ModelEntity(
-            mesh: .generateSphere(radius: 0.035),
-            materials: [SimpleMaterial()]
-        )
-        sphere.name = marker.name
-        anchor.addChild(sphere)
+        let solid = solidMaterial(for: marker.serviceType)
+        let glow = glowMaterial(for: marker.serviceType)
 
-        let stem = ModelEntity(
-            mesh: .generateBox(width: 0.012, height: 0.20, depth: 0.012),
-            materials: [SimpleMaterial()]
+        // Exact service point.
+        let point = ModelEntity(
+            mesh: .generateSphere(radius: 0.070),
+            materials: [solid]
         )
-        stem.position.y = 0.10
-        anchor.addChild(stem)
+        point.name = marker.name
+        anchor.addChild(point)
+
+        // White centre makes the exact picked point easy to identify.
+        let centre = ModelEntity(
+            mesh: .generateSphere(radius: 0.018),
+            materials: [SimpleMaterial(color: .white, roughness: 0.1, isMetallic: false)]
+        )
+        anchor.addChild(centre)
+
+        // Long vertical service beam: 12 m by default, centred on the real pin so it
+        // projects above and below the marked point through floors / ceilings.
+        let beam = ModelEntity(
+            mesh: .generateBox(width: 0.050, height: verticalBeamLength, depth: 0.050),
+            materials: [solid]
+        )
+        anchor.addChild(beam)
+
+        // Softer outer beam gives the marker more visual presence in bright spaces.
+        let halo = ModelEntity(
+            mesh: .generateBox(width: 0.120, height: verticalBeamLength, depth: 0.120),
+            materials: [glow]
+        )
+        anchor.addChild(halo)
+
+        // Horizontal cross at the exact marked elevation.
+        let crossX = ModelEntity(
+            mesh: .generateBox(width: 0.34, height: 0.012, depth: 0.024),
+            materials: [solid]
+        )
+        anchor.addChild(crossX)
+
+        let crossZ = ModelEntity(
+            mesh: .generateBox(width: 0.024, height: 0.012, depth: 0.34),
+            materials: [solid]
+        )
+        anchor.addChild(crossZ)
 
         arView.scene.addAnchor(anchor)
         markerEntities[marker.id] = anchor
@@ -155,6 +211,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                 arView?.scene.removeAnchor(guideEntity)
             }
             guideEntity = nil
+            guideMarkerID = nil
             return
         }
 
@@ -162,20 +219,44 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         horizontalDistance = sqrt(delta.x * delta.x + delta.z * delta.z)
         verticalDifference = delta.y
 
+        // A bright target cross is always drawn at the user's current height but at
+        // the selected pin's X/Z position. This is the "directly above/below" target.
         let guidePosition = SIMD3<Float>(marker.position.x, currentPosition.y, marker.position.z)
-        if let guideEntity {
+
+        if let guideEntity, guideMarkerID == marker.id {
             guideEntity.position = guidePosition
-        } else {
-            let anchor = AnchorEntity(world: guidePosition)
-            let target = ModelEntity(
-                mesh: .generateSphere(radius: 0.07),
-                materials: [SimpleMaterial()]
-            )
-            target.scale = SIMD3<Float>(1.0, 0.12, 1.0)
-            anchor.addChild(target)
-            arView.scene.addAnchor(anchor)
-            guideEntity = anchor
+            return
         }
+
+        if let guideEntity {
+            arView.scene.removeAnchor(guideEntity)
+            self.guideEntity = nil
+        }
+
+        let anchor = AnchorEntity(world: guidePosition)
+        let material = solidMaterial(for: marker.serviceType)
+
+        let targetX = ModelEntity(
+            mesh: .generateBox(width: 0.70, height: 0.020, depth: 0.050),
+            materials: [material]
+        )
+        anchor.addChild(targetX)
+
+        let targetZ = ModelEntity(
+            mesh: .generateBox(width: 0.050, height: 0.020, depth: 0.70),
+            materials: [material]
+        )
+        anchor.addChild(targetZ)
+
+        let targetPoint = ModelEntity(
+            mesh: .generateSphere(radius: 0.080),
+            materials: [material]
+        )
+        anchor.addChild(targetPoint)
+
+        arView.scene.addAnchor(anchor)
+        guideEntity = anchor
+        guideMarkerID = marker.id
     }
 
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
