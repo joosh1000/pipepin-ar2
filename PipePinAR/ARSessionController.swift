@@ -14,7 +14,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var lidarAvailable = false
     @Published var lidarMeshVisible = false
     @Published var mappedSurfaceCount = 0
-    @Published var verticalBeamLength: Float = 12.0
+    @Published var beamLength: Float = 12.0
 
     var markerStore: MarkerStore?
     private var markerEntities: [UUID: AnchorEntity] = [:]
@@ -58,14 +58,31 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         rebuildMarkerEntities()
     }
 
-    func placeMarkerAtCenter(serviceType: ServiceType) {
+    func placeMarkerAtCenter(
+        serviceType: ServiceType,
+        orientation: ServiceOrientation,
+        flowDirection: FlowDirection
+    ) {
         guard let arView else { return }
         let screenPoint = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
-        placeMarker(screenPoint: screenPoint, serviceType: serviceType)
+        placeMarker(
+            screenPoint: screenPoint,
+            serviceType: serviceType,
+            orientation: orientation,
+            flowDirection: flowDirection
+        )
     }
 
-    private func placeMarker(screenPoint: CGPoint, serviceType: ServiceType) {
-        guard let arView, let markerStore else { return }
+    private func placeMarker(
+        screenPoint: CGPoint,
+        serviceType: ServiceType,
+        orientation: ServiceOrientation,
+        flowDirection: FlowDirection
+    ) {
+        guard let arView, let markerStore, let activeSiteID = markerStore.activeSiteID else {
+            statusText = "Select a site before placing services."
+            return
+        }
 
         let results = arView.raycast(from: screenPoint, allowing: .estimatedPlane, alignment: .any)
         guard let hit = results.first else {
@@ -75,26 +92,46 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
         let matrix = hit.worldTransform
         let position = SIMD3<Float>(matrix.columns.3.x, matrix.columns.3.y, matrix.columns.3.z)
-        let number = markerStore.markers.filter { $0.serviceType == serviceType }.count + 1
+        let beamYaw = currentHorizontalBeamYaw()
+        let number = markerStore.visibleMarkers.filter { $0.serviceType == serviceType }.count + 1
         let marker = SavedMarker(
+            siteID: activeSiteID,
             name: "\(serviceType.title) \(number)",
             serviceType: serviceType,
+            orientation: orientation,
+            flowDirection: flowDirection,
+            beamYaw: beamYaw,
             position: position
         )
 
         markerStore.add(marker)
         addMarkerEntity(marker)
         selectMarker(marker)
-        statusText = "\(marker.name) pinned · vertical locator beam is live."
+
+        let directionText = flowDirection == .none ? "no direction arrows" : "direction arrows on"
+        statusText = "\(marker.name) pinned · \(orientation.title.lowercased()) beam · \(directionText)."
+    }
+
+    private func currentHorizontalBeamYaw() -> Float {
+        guard let cameraTransform = arView?.session.currentFrame?.camera.transform else { return 0 }
+        let right = SIMD3<Float>(
+            cameraTransform.columns.0.x,
+            0,
+            cameraTransform.columns.0.z
+        )
+        let length = simd_length(right)
+        guard length > 0.001 else { return 0 }
+        let direction = right / length
+        return atan2(-direction.z, direction.x)
     }
 
     func undoLastMarker() {
-        guard let markerStore, let last = markerStore.markers.last else { return }
+        guard let markerStore, let last = markerStore.visibleMarkers.last else { return }
         if let anchor = markerEntities[last.id] {
             arView?.scene.removeAnchor(anchor)
             markerEntities[last.id] = nil
         }
-        markerStore.deleteLast()
+        markerStore.deleteLastVisible()
         updateGuide()
         statusText = "Last pin removed."
     }
@@ -103,7 +140,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         guard let arView, let markerStore else { return }
         markerEntities.values.forEach { arView.scene.removeAnchor($0) }
         markerEntities.removeAll()
-        markerStore.markers.forEach(addMarkerEntity)
+        markerStore.visibleMarkers.forEach(addMarkerEntity)
         updateGuide()
     }
 
@@ -113,9 +150,9 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func setBeamLength(_ length: Float) {
-        verticalBeamLength = min(max(length, 4.0), 20.0)
+        beamLength = min(max(length, 4.0), 20.0)
         rebuildMarkerEntities()
-        statusText = "Locator beams set to \(Int(verticalBeamLength)) m."
+        statusText = "Locator beams set to \(Int(beamLength)) m."
     }
 
     func toggleLiDARMesh() {
@@ -136,15 +173,23 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     private func solidMaterial(for serviceType: ServiceType) -> SimpleMaterial {
         SimpleMaterial(
             color: serviceType.uiColor,
-            roughness: 0.18,
+            roughness: 0.12,
             isMetallic: false
         )
     }
 
     private func glowMaterial(for serviceType: ServiceType) -> SimpleMaterial {
         SimpleMaterial(
-            color: serviceType.uiColor.withAlphaComponent(0.22),
-            roughness: 0.10,
+            color: serviceType.uiColor.withAlphaComponent(0.30),
+            roughness: 0.08,
+            isMetallic: false
+        )
+    }
+
+    private func arrowMaterial() -> SimpleMaterial {
+        SimpleMaterial(
+            color: UIColor.white.withAlphaComponent(0.98),
+            roughness: 0.08,
             isMetallic: false
         )
     }
@@ -156,51 +201,133 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         let solid = solidMaterial(for: marker.serviceType)
         let glow = glowMaterial(for: marker.serviceType)
 
-        // Exact service point.
+        let pointGlow = ModelEntity(
+            mesh: .generateSphere(radius: 0.115),
+            materials: [glow]
+        )
+        anchor.addChild(pointGlow)
+
         let point = ModelEntity(
-            mesh: .generateSphere(radius: 0.070),
+            mesh: .generateSphere(radius: 0.072),
             materials: [solid]
         )
         point.name = marker.name
         anchor.addChild(point)
 
-        // White centre makes the exact picked point easy to identify.
         let centre = ModelEntity(
-            mesh: .generateSphere(radius: 0.018),
-            materials: [SimpleMaterial(color: .white, roughness: 0.1, isMetallic: false)]
+            mesh: .generateSphere(radius: 0.019),
+            materials: [SimpleMaterial(color: .white, roughness: 0.08, isMetallic: false)]
         )
         anchor.addChild(centre)
 
-        // Long vertical service beam: 12 m by default, centred on the real pin so it
-        // projects above and below the marked point through floors / ceilings.
-        let beam = ModelEntity(
-            mesh: .generateBox(width: 0.050, height: verticalBeamLength, depth: 0.050),
-            materials: [solid]
-        )
-        anchor.addChild(beam)
+        let beamRoot = Entity()
+        if marker.orientation == .horizontal {
+            beamRoot.orientation = simd_quatf(angle: marker.beamYaw, axis: SIMD3<Float>(0, 1, 0))
+        }
+        anchor.addChild(beamRoot)
 
-        // Softer outer beam gives the marker more visual presence in bright spaces.
-        let halo = ModelEntity(
-            mesh: .generateBox(width: 0.120, height: verticalBeamLength, depth: 0.120),
-            materials: [glow]
-        )
-        anchor.addChild(halo)
+        let beam: ModelEntity
+        let halo: ModelEntity
+        if marker.orientation == .vertical {
+            beam = ModelEntity(
+                mesh: .generateBox(width: 0.060, height: beamLength, depth: 0.060),
+                materials: [solid]
+            )
+            halo = ModelEntity(
+                mesh: .generateBox(width: 0.145, height: beamLength, depth: 0.145),
+                materials: [glow]
+            )
+        } else {
+            beam = ModelEntity(
+                mesh: .generateBox(width: beamLength, height: 0.060, depth: 0.060),
+                materials: [solid]
+            )
+            halo = ModelEntity(
+                mesh: .generateBox(width: beamLength, height: 0.145, depth: 0.145),
+                materials: [glow]
+            )
+        }
+        beamRoot.addChild(halo)
+        beamRoot.addChild(beam)
 
-        // Horizontal cross at the exact marked elevation.
+        addDirectionArrows(to: beamRoot, marker: marker)
+
+        // Exact service point cross. It stays independent of beam orientation so the
+        // original picked point remains obvious even with a long horizontal run.
         let crossX = ModelEntity(
-            mesh: .generateBox(width: 0.34, height: 0.012, depth: 0.024),
+            mesh: .generateBox(width: 0.38, height: 0.014, depth: 0.028),
             materials: [solid]
         )
         anchor.addChild(crossX)
 
         let crossZ = ModelEntity(
-            mesh: .generateBox(width: 0.024, height: 0.012, depth: 0.34),
+            mesh: .generateBox(width: 0.028, height: 0.014, depth: 0.38),
             materials: [solid]
         )
         anchor.addChild(crossZ)
 
         arView.scene.addAnchor(anchor)
         markerEntities[marker.id] = anchor
+    }
+
+    private func addDirectionArrows(to beamRoot: Entity, marker: SavedMarker) {
+        guard marker.flowDirection != .none else { return }
+
+        let arrowCount = max(3, min(7, Int(beamLength / 2.0)))
+        let usableLength = beamLength * 0.72
+        let spacing = usableLength / Float(max(1, arrowCount - 1))
+        let start = -usableLength / 2
+
+        for index in 0..<arrowCount {
+            let offset = start + Float(index) * spacing
+            let arrow = makeChevron(
+                orientation: marker.orientation,
+                flowDirection: marker.flowDirection
+            )
+
+            if marker.orientation == .vertical {
+                arrow.position = SIMD3<Float>(0, offset, 0.090)
+            } else {
+                arrow.position = SIMD3<Float>(offset, 0, 0.090)
+            }
+            beamRoot.addChild(arrow)
+        }
+    }
+
+    private func makeChevron(
+        orientation: ServiceOrientation,
+        flowDirection: FlowDirection
+    ) -> Entity {
+        let root = Entity()
+        let material = arrowMaterial()
+        let segmentLength: Float = 0.20
+        let thickness: Float = 0.020
+        let depth: Float = 0.026
+
+        let upper = ModelEntity(
+            mesh: .generateBox(width: segmentLength, height: thickness, depth: depth),
+            materials: [material]
+        )
+        let lower = ModelEntity(
+            mesh: .generateBox(width: segmentLength, height: thickness, depth: depth),
+            materials: [material]
+        )
+
+        // Build a > chevron in local X/Y, then rotate the complete chevron for
+        // vertical or reverse direction. Only box meshes are used for compile safety.
+        upper.position = SIMD3<Float>(-0.045, 0.050, 0)
+        lower.position = SIMD3<Float>(-0.045, -0.050, 0)
+        upper.orientation = simd_quatf(angle: -.pi / 4, axis: SIMD3<Float>(0, 0, 1))
+        lower.orientation = simd_quatf(angle: .pi / 4, axis: SIMD3<Float>(0, 0, 1))
+        root.addChild(upper)
+        root.addChild(lower)
+
+        var angle: Float = orientation == .vertical ? .pi / 2 : 0
+        if flowDirection == .reverse {
+            angle += .pi
+        }
+        root.orientation = simd_quatf(angle: angle, axis: SIMD3<Float>(0, 0, 1))
+        return root
     }
 
     private func updateGuide() {
@@ -219,8 +346,8 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         horizontalDistance = sqrt(delta.x * delta.x + delta.z * delta.z)
         verticalDifference = delta.y
 
-        // A bright target cross is always drawn at the user's current height but at
-        // the selected pin's X/Z position. This is the "directly above/below" target.
+        // The selected pin always gets an above/below target at the user's current
+        // height, regardless of whether the service beam itself is vertical/horizontal.
         let guidePosition = SIMD3<Float>(marker.position.x, currentPosition.y, marker.position.z)
 
         if let guideEntity, guideMarkerID == marker.id {
@@ -235,21 +362,28 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
         let anchor = AnchorEntity(world: guidePosition)
         let material = solidMaterial(for: marker.serviceType)
+        let glow = glowMaterial(for: marker.serviceType)
+
+        let targetGlow = ModelEntity(
+            mesh: .generateSphere(radius: 0.15),
+            materials: [glow]
+        )
+        anchor.addChild(targetGlow)
 
         let targetX = ModelEntity(
-            mesh: .generateBox(width: 0.70, height: 0.020, depth: 0.050),
+            mesh: .generateBox(width: 0.78, height: 0.024, depth: 0.056),
             materials: [material]
         )
         anchor.addChild(targetX)
 
         let targetZ = ModelEntity(
-            mesh: .generateBox(width: 0.050, height: 0.020, depth: 0.70),
+            mesh: .generateBox(width: 0.056, height: 0.024, depth: 0.78),
             materials: [material]
         )
         anchor.addChild(targetZ)
 
         let targetPoint = ModelEntity(
-            mesh: .generateSphere(radius: 0.080),
+            mesh: .generateSphere(radius: 0.085),
             materials: [material]
         )
         anchor.addChild(targetPoint)
