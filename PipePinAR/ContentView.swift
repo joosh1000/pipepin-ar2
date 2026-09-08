@@ -180,7 +180,7 @@ struct SitesHomeView: View {
                     Text("PIPEPIN")
                         .font(.system(size: 18, weight: .heavy, design: .rounded))
                         .tracking(2.0)
-                    Text("0.6")
+                    Text("0.6.1")
                         .font(.system(size: 8, weight: .heavy, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -445,7 +445,7 @@ struct ARWorkspaceView: View {
                                 .lineLimit(1)
                             HStack(spacing: 5) {
                                 Text("PIPEPIN")
-                                Text("0.6")
+                                Text("0.6.1")
                             }
                             .font(.system(size: 8, weight: .heavy, design: .rounded))
                             .tracking(1.0)
@@ -756,13 +756,16 @@ struct ARWorkspaceView: View {
 
                 Button { arController.saveSpatialSiteMap() } label: {
                     deckWideButton(
-                        title: "SAVE 3D MAP",
-                        subtitle: arController.hasSavedSpatialMesh ? "Update site model" : "Capture site model",
-                        image: "square.and.arrow.down",
-                        active: false
+                        title: arController.spatialMapSaveState == .saving ? "SAVING…" : (arController.spatialMapSaveState == .saved ? "SAVED ✓" : "SAVE + LOCK MAP"),
+                        subtitle: arController.spatialMapSaveState == .saved
+                            ? "Verified · \(arController.mapFileSizeKB) KB world map"
+                            : "World map + 3D mesh",
+                        image: arController.spatialMapSaveState == .saved ? "checkmark.shield.fill" : "square.and.arrow.down",
+                        active: arController.spatialMapSaveState == .saved
                     )
                 }
                 .buttonStyle(.plain)
+                .disabled(arController.spatialMapSaveState == .saving)
             }
 
             HStack(spacing: 8) {
@@ -778,6 +781,15 @@ struct ARWorkspaceView: View {
             .font(.system(size: 8, weight: .heavy, design: .rounded))
             .foregroundStyle(.white.opacity(0.60))
             .buttonStyle(.plain)
+
+            HStack(spacing: 6) {
+                Image(systemName: "bolt.fill")
+                Text("30 FPS · mesh-only spatial capture")
+                Spacer()
+                Text("THERMAL \(arController.thermalText.uppercased())")
+            }
+            .font(.system(size: 7, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white.opacity(0.42))
         }
     }
 
@@ -1153,6 +1165,11 @@ struct ScanView: View {
                 Section("Saved Spatial Site Map") {
                     LabeledContent("Relocalisation map", value: controller.hasSavedWorldMap ? "Available" : "Not saved")
                     LabeledContent("3D mesh snapshot", value: controller.hasSavedSpatialMesh ? "Available" : "Not saved")
+                    LabeledContent("Save state", value: controller.spatialMapSaveState.rawValue)
+                    if controller.hasSavedWorldMap {
+                        LabeledContent("World map file", value: "\(controller.mapFileSizeKB) KB")
+                    }
+                    LabeledContent("Thermal", value: controller.thermalText)
                     if controller.hasSavedSpatialMesh {
                         LabeledContent("Mesh anchors", value: "\(controller.spatialMeshAnchorCount)")
                         LabeledContent("Vertices", value: "\(controller.spatialMeshVertexCount)")
@@ -1175,7 +1192,7 @@ struct ScanView: View {
                     }
                     .disabled(!controller.hasSavedWorldMap)
 
-                    Text("0.6 saves both the AR relocalisation map and a raw LiDAR mesh snapshot for this Site. CAUTION keeps fixed beams visible; only a major or sustained position loss hides them.")
+                    Text("0.6.1 only calls a Site Map saved after both the AR relocalisation map and LiDAR mesh have been written and verified. Saved pins are hidden if that map cannot be restored, rather than being shown in a new coordinate system.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

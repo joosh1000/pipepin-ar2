@@ -37,6 +37,13 @@ enum PositionTrust: String {
     case lost = "LOST"
 }
 
+enum SpatialMapSaveState: String {
+    case unsaved = "UNSAVED"
+    case saving = "SAVING"
+    case saved = "SAVED"
+    case failed = "SAVE FAILED"
+}
+
 enum MappingLens: String, CaseIterable, Identifiable {
     case automatic = "Auto"
     case ultraWide = "0.5×"
@@ -91,6 +98,10 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var spatialMeshFaceCount = 0
     @Published var spatialMeshSavedAt: Date?
     @Published var meshAimAvailable = false
+    @Published var spatialMapSaveState: SpatialMapSaveState = .unsaved
+    @Published var siteAlignmentReady = false
+    @Published var thermalText = "Nominal"
+    @Published var mapFileSizeKB = 0
 
     var markerStore: MarkerStore?
 
@@ -115,6 +126,10 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     private var limitedTrackingBeganAt: Date?
     private var lastMeshAimPosition: SIMD3<Float>?
     private var frameCounter = 0
+    private var lastProcessedFrameTimestamp: TimeInterval?
+    private var relocalizationRequired = false
+    private var relocalizationSeen = false
+    private var hasUnsafePinsWithoutMap = false
 
     private struct PendingPin {
         let serviceType: ServiceType
@@ -152,33 +167,34 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             view.environment.sceneUnderstanding.options.insert(.collision)
         }
         refreshSavedMapState()
+        if hasSavedWorldMap {
+            // A saved site opens in low-power relocalisation mode. Do not immediately
+            // start drawing a brand-new live mesh over a map the user already saved.
+            spatialMode = .locate
+            xrayVisible = false
+            lidarMeshVisible = false
+        }
         startSession(reset: true, preferSavedMap: true)
     }
 
     func startSession(reset: Bool = false, preferSavedMap: Bool = true) {
         guard let arView else { return }
+        let preserveAlignment = !reset && !preferSavedMap && siteAlignmentReady
 
         let config = ARWorldTrackingConfiguration()
         config.worldAlignment = .gravity
         config.planeDetection = [.horizontal, .vertical]
-        config.environmentTexturing = .automatic
+        // We do not need environment texture capture for a trade mapping tool. Turning it
+        // off removes GPU/camera work without affecting tracking or the LiDAR mesh.
+        config.environmentTexturing = .none
         config.isLightEstimationEnabled = true
 
-        // MAP and PIN keep the LiDAR mesh alive. LOCATE drops the expensive mesh/depth
-        // pipeline once the site has already been captured, which materially reduces
-        // heat and battery drain while walking around looking for a saved service.
+        // 0.6.1 power change: scene reconstruction is the only heavy spatial feature used
+        // in MAP/PIN. We no longer run sceneDepth + smoothedSceneDepth continuously as
+        // well. The reconstructed mesh is the primary pin surface; estimated raycast is
+        // the fallback. LOCATE runs world tracking only.
         if spatialMode != .locate {
-            if ARWorldTrackingConfiguration.supportsFrameSemantics(.sceneDepth) {
-                config.frameSemantics.insert(.sceneDepth)
-            }
-            if ARWorldTrackingConfiguration.supportsFrameSemantics(.smoothedSceneDepth) {
-                config.frameSemantics.insert(.smoothedSceneDepth)
-            }
-
-            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.meshWithClassification) {
-                config.sceneReconstruction = .meshWithClassification
-                lidarAvailable = true
-            } else if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
+            if ARWorldTrackingConfiguration.supportsSceneReconstruction(.mesh) {
                 config.sceneReconstruction = .mesh
                 lidarAvailable = true
             }
@@ -186,18 +202,42 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
         applyPreferredVideoFormat(to: config)
 
-        loadedSavedMapForSession = false
-        if preferSavedMap, let siteID = markerStore?.activeSiteID, let savedMap = loadWorldMap(siteID: siteID) {
-            config.initialWorldMap = savedMap
-            loadedSavedMapForSession = true
-            markersReliable = false
-            trackingText = "Relocalizing"
-            statusText = "Saved site map loaded · scan the room until PipePin relocks."
+        if preserveAlignment {
+            // Configuration-only mode change inside an already locked session. Keep the
+            // trusted coordinate frame and do not pretend we need to relocalise again.
+            relocalizationRequired = false
+            relocalizationSeen = false
+            hasUnsafePinsWithoutMap = false
+            siteAlignmentReady = true
         } else {
-            markersReliable = false
-            statusText = lidarAvailable
-                ? "LiDAR mapping active · scan the room before precision pinning."
-                : "AR tracking active · scan the room before pinning."
+            loadedSavedMapForSession = false
+            relocalizationRequired = false
+            relocalizationSeen = false
+            siteAlignmentReady = false
+            hasUnsafePinsWithoutMap = false
+            if preferSavedMap, let siteID = markerStore?.activeSiteID, let savedMap = loadWorldMap(siteID: siteID) {
+                config.initialWorldMap = savedMap
+                loadedSavedMapForSession = true
+                relocalizationRequired = true
+                markersReliable = false
+                trackingText = "Relocalizing"
+                statusText = "Saved Site Map found · look around the mapped area until SITE LOCKED appears."
+            } else {
+                markersReliable = false
+                // Critical safety fix: saved XYZ values only make sense in the coordinate
+                // system that created them. Never display old pins in a fresh AR origin if
+                // the matching world map is missing or failed to load.
+                if reset, preferSavedMap, let markerStore, !markerStore.visibleMarkers.isEmpty {
+                    hasUnsafePinsWithoutMap = true
+                    positionIntegrityLost = true
+                    positionTrust = .lost
+                    statusText = "SITE MAP MISSING · existing pins are hidden. Re-map this Site before trusting their positions."
+                } else {
+                    statusText = lidarAvailable
+                        ? "LiDAR mapping active · scan the room before precision pinning."
+                        : "AR tracking active · scan the room before pinning."
+                }
+            }
         }
 
         let options: ARSession.RunOptions = reset ? [.resetTracking, .removeExistingAnchors] : []
@@ -210,18 +250,13 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
         previousFramePosition = nil
         previousFrameTimestamp = nil
+        lastProcessedFrameTimestamp = nil
         normalFrameStreak = 0
-        anchorDriftAlarm = false
-        anchorDriftMM = 0
         aimErrorPixels = nil
         aimSpreadMM = 0
-        positionIntegrityLost = false
-        positionTrust = .caution
         limitedTrackingBeganAt = nil
         lastMeshAimPosition = nil
         meshAimAvailable = false
-        runtimeMarkerPositions.removeAll()
-        lastObservedAnchorPositions.removeAll()
         captureSamples.removeAll()
         pendingPin = nil
         pendingAccuracyMarker = nil
@@ -229,7 +264,19 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         captureProgress = 0
         accuracyResultMM = nil
 
-        rebuildMarkerEntities()
+        if reset {
+            anchorDriftAlarm = false
+            anchorDriftMM = 0
+            positionIntegrityLost = hasUnsafePinsWithoutMap
+            positionTrust = hasUnsafePinsWithoutMap ? .lost : .caution
+            runtimeMarkerPositions.removeAll()
+            lastObservedAnchorPositions.removeAll()
+            rebuildMarkerEntities()
+        } else {
+            // Do not recreate service anchors/entities on a capability-only config change.
+            // Their current world transforms remain untouched.
+            setMarkerVisibility(!hasUnsafePinsWithoutMap && positionTrust != .lost && (!relocalizationRequired || siteAlignmentReady))
+        }
     }
 
     func placeMarkerAtCenter(
@@ -368,23 +415,17 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func beginAccuracyCheck(marker: SavedMarker) {
-        guard !isPrecisionCapturing else { return }
         guard precisionReady else {
             statusText = precisionBlockReason()
             return
         }
-        guard lidarAvailable, depthDistance != nil, depthConfidence >= 1 else {
-            statusText = "Accuracy check needs a confident LiDAR depth reading at the reticle."
+        guard let point = sceneMeshHitAtReticle() else {
+            statusText = "Accuracy check needs a MESH HIT at the centre reticle."
             return
         }
-
-        pendingPin = nil
-        pendingAccuracyMarker = marker
-        captureSamples.removeAll()
-        captureProgress = 0
-        isPrecisionCapturing = true
-        accuracyResultMM = nil
-        statusText = "Accuracy check · aim at the original physical point and hold still."
+        let error = simd_distance(marker.position, point)
+        accuracyResultMM = Int((error * 1000).rounded())
+        statusText = "Return accuracy: \(accuracyResultMM ?? 0) mm from the saved pin."
     }
 
     func cancelPrecisionCapture() {
@@ -462,7 +503,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         if trackingText != "Tracking good" { return "Precision blocked · \(trackingText.lowercased())." }
         if motionSpeed > 0.25 { return "Precision blocked · hold the phone steadier." }
         if lowLight && !torchIsOn { return "Low light · switch the torch on or use Auto." }
-        if lidarAvailable && !meshAimAvailable && depthConfidence < 1 { return "Spatial mesh/depth confidence is low · scan the target surface and try again." }
+        if lidarAvailable && !meshAimAvailable { return "No mesh under the reticle · scan the target surface and try again." }
         if mappingText == "Map unavailable" { return "Scan more of the room before precision pinning." }
         return "Keep scanning the surroundings until Precision Ready appears."
     }
@@ -526,28 +567,51 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
     func setSpatialMode(_ mode: SpatialMode) {
         guard spatialMode != mode else { return }
+
+        // If this session began from a saved Site Map, do not start rebuilding spatial
+        // data until ARKit has actually relocalised to the old coordinate system.
+        if loadedSavedMapForSession && !siteAlignmentReady && mode != .locate {
+            statusText = "WAIT FOR SITE LOCK · scan the saved area until relocalisation completes."
+            return
+        }
+
+        let previous = spatialMode
         spatialMode = mode
         switch mode {
         case .map:
-            statusText = "MAP SITE · move slowly and let the LiDAR mesh grow through doors, stairs and rooms."
+            statusText = hasSavedWorldMap
+                ? "UPDATE MAP · saved Site Map is preserved while live LiDAR geometry is extended."
+                : "MAP SITE · move slowly and let the LiDAR mesh grow through doors, stairs and rooms."
             setXRay(true)
         case .pin:
             statusText = "PIN SERVICE · aim at the reconstructed mesh and place the service directly onto it."
             setXRay(false)
         case .locate:
-            statusText = "LOCATE · lower-power tracking. Choose a saved service from Pins."
+            statusText = "LOCATE · world tracking only for lower battery use."
             setXRay(false)
         }
-        // Changing capabilities without resetting tracking preserves the current world
-        // coordinate system while allowing Locate to back off the expensive LiDAR work.
+
+        // MAP <-> PIN use exactly the same AR session/configuration in 0.6.1. This is
+        // deliberate: simply changing the UI must not tear down/recreate mesh anchors
+        // or give ARKit another opportunity to shift the working coordinate frame.
+        if (previous == .map && mode == .pin) || (previous == .pin && mode == .map) {
+            return
+        }
+
+        // Entering or leaving LOCATE changes the expensive scene-reconstruction feature.
+        // Tracking is *not* reset, so the current world origin is preserved.
         startSession(reset: false, preferSavedMap: false)
     }
 
     func setMappingLens(_ lens: MappingLens) {
         guard mappingLens != lens else { return }
+        if let markerStore, !markerStore.visibleMarkers.isEmpty {
+            statusText = "Camera lens locked after the first service pin to protect the site coordinate system."
+            return
+        }
         mappingLens = lens
         statusText = lens == .ultraWide
-            ? "Experimental 0.5× mapping view selected. Use it to keep more room geometry in frame."
+            ? "Experimental 0.5× mapping selected · choose the mapping lens before placing services."
             : "Camera mapping view set to \(lens.rawValue)."
         startSession(reset: false, preferSavedMap: false)
     }
@@ -564,40 +628,36 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         let formats = ARWorldTrackingConfiguration.supportedVideoFormats
         guard !formats.isEmpty else { return }
 
-        let desiredDevice: AVCaptureDevice.DeviceType?
+        let desiredDevice: AVCaptureDevice.DeviceType
         if spatialMode == .pin {
-            // Precision targeting always returns to the normal wide camera. The 0.5×
-            // experiment is for mapping continuity, not the final service aim.
             desiredDevice = .builtInWideAngleCamera
         } else {
             switch mappingLens {
-            case .automatic: desiredDevice = .builtInWideAngleCamera
+            case .automatic, .wide: desiredDevice = .builtInWideAngleCamera
             case .ultraWide: desiredDevice = .builtInUltraWideCamera
-            case .wide: desiredDevice = .builtInWideAngleCamera
             }
         }
 
-        var candidates = formats
-        if let desiredDevice {
-            let matching = candidates.filter { $0.captureDeviceType == desiredDevice }
-            if !matching.isEmpty { candidates = matching }
-        }
+        var candidates = formats.filter { $0.captureDeviceType == desiredDevice }
+        if candidates.isEmpty { candidates = formats }
 
-        // Mapping and Locate favour 30 fps for battery/thermal headroom. Pin mode can
-        // use the highest supported rate while the user is doing a short precision task.
-        if spatialMode != .pin {
-            let thirty = candidates.filter { $0.framesPerSecond <= 30 }
-            if !thirty.isEmpty { candidates = thirty }
-        }
+        // Keep every mode at <=30 fps. The 60 fps precision session in 0.6 doubled
+        // camera/RealityKit work for little practical benefit and was a major battery cost.
+        let thirty = candidates.filter { $0.framesPerSecond <= 30 }
+        if !thirty.isEmpty { candidates = thirty }
 
-        if let chosen = candidates.sorted(by: { lhs, rhs in
-            if lhs.framesPerSecond != rhs.framesPerSecond {
-                return lhs.framesPerSecond > rhs.framesPerSecond
-            }
+        // Prefer a sensible ~1080p class format rather than always taking the largest
+        // 30 fps feed. ARKit still does its internal tracking, while our UI/GPU has less
+        // camera data to push around.
+        let targetPixels: CGFloat = 1920 * 1080
+        if let chosen = candidates.min(by: { lhs, rhs in
             let la = lhs.imageResolution.width * lhs.imageResolution.height
             let ra = rhs.imageResolution.width * rhs.imageResolution.height
-            return la > ra
-        }).first {
+            let ld = abs(la - targetPixels)
+            let rd = abs(ra - targetPixels)
+            if ld != rd { return ld < rd }
+            return lhs.framesPerSecond < rhs.framesPerSecond
+        }) {
             config.videoFormat = chosen
         }
     }
@@ -665,8 +725,23 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     func saveSpatialSiteMap() {
-        guard let frame = arView?.session.currentFrame, let siteID = markerStore?.activeSiteID else {
+        guard let arView, let frame = arView.session.currentFrame, let siteID = markerStore?.activeSiteID else {
+            spatialMapSaveState = .failed
             statusText = "Spatial map unavailable · start scanning the site first."
+            return
+        }
+        guard !worldMapSaveInFlight else {
+            statusText = "Site Map save already in progress."
+            return
+        }
+        guard frame.worldMappingStatus == .extending || frame.worldMappingStatus == .mapped else {
+            spatialMapSaveState = .failed
+            statusText = "MAP NOT READY · keep scanning until Map extending/mapped before saving."
+            return
+        }
+        if anchorDriftAlarm {
+            spatialMapSaveState = .failed
+            statusText = "Map save blocked · resolve the major position-shift warning first."
             return
         }
 
@@ -674,72 +749,87 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             guard let mesh = anchor as? ARMeshAnchor else { return nil }
             return mesh.copy() as? ARMeshAnchor
         }
-
         guard !meshCopies.isEmpty else {
+            spatialMapSaveState = .failed
             statusText = "No LiDAR mesh yet · scan walls, floor and ceiling before saving."
             return
         }
 
-        statusText = "Saving spatial site map…"
-        DispatchQueue.global(qos: .utility).async {
-            do {
-                let metadata = try SpatialMeshStore.save(meshAnchors: meshCopies, siteID: siteID)
-                Task { @MainActor in
-                    self.hasSavedSpatialMesh = true
-                    self.spatialMeshAnchorCount = metadata.anchorCount
-                    self.spatialMeshVertexCount = metadata.vertexCount
-                    self.spatialMeshFaceCount = metadata.faceCount
-                    self.spatialMeshSavedAt = metadata.savedAt
-                    self.statusText = "3D site mesh captured · now saving relocalisation map."
-                    self.saveSiteWorldMap(silent: false)
-                }
-            } catch {
-                Task { @MainActor in
-                    self.statusText = "Could not archive the 3D site mesh."
-                }
-            }
-        }
-    }
-
-    func saveSiteWorldMap(silent: Bool = false) {
-        guard let arView, let siteID = markerStore?.activeSiteID else { return }
-        guard !worldMapSaveInFlight else {
-            if !silent { statusText = "Site map save already in progress." }
-            return
-        }
-        if anchorDriftAlarm {
-            if !silent { statusText = "Map save blocked · resolve the anchor-shift warning first." }
-            return
-        }
-        let url = worldMapURL(siteID: siteID)
+        // Save the ARWorldMap first. In 0.6 the mesh archive could succeed while the
+        // relocalisation map failed afterwards, leaving the UI looking 'saved' even
+        // though the pins had no recoverable coordinate system. 0.6.1 treats both
+        // files as one transaction and only shows SAVED after reading them back.
+        spatialMapSaveState = .saving
         worldMapSaveInFlight = true
+        statusText = "SAVING SITE MAP · keep PipePin open and hold position…"
+        let url = worldMapURL(siteID: siteID)
+
         arView.session.getCurrentWorldMap { [weak self] worldMap, error in
             guard let self else { return }
             guard let worldMap, error == nil else {
                 Task { @MainActor in
                     self.worldMapSaveInFlight = false
-                    if !silent { self.statusText = "Site map not ready yet · keep scanning and try again." }
+                    self.spatialMapSaveState = .failed
+                    self.statusText = "SAVE FAILED · ARKit could not produce a relocalisation map. Scan more of the room and try again."
                 }
                 return
             }
 
-            do {
-                let data = try NSKeyedArchiver.archivedData(withRootObject: worldMap, requiringSecureCoding: true)
-                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
-                try data.write(to: url, options: .atomic)
-                Task { @MainActor in
-                    self.worldMapSaveInFlight = false
-                    self.hasSavedWorldMap = true
-                    self.mapSavedAt = Date()
-                    if !silent { self.statusText = "Site spatial map saved for relocalisation." }
-                }
-            } catch {
-                Task { @MainActor in
-                    self.worldMapSaveInFlight = false
-                    if !silent { self.statusText = "Could not save the site spatial map." }
+            DispatchQueue.global(qos: .utility).async {
+                do {
+                    let mapData = try NSKeyedArchiver.archivedData(withRootObject: worldMap, requiringSecureCoding: true)
+                    try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+                    try mapData.write(to: url, options: .atomic)
+
+                    let metadata = try SpatialMeshStore.save(meshAnchors: meshCopies, siteID: siteID)
+
+                    // Read both files back immediately. A green SAVED state means the
+                    // exact data we need next time can actually be opened again.
+                    let verifyData = try Data(contentsOf: url)
+                    guard let _ = try NSKeyedUnarchiver.unarchivedObject(ofClass: ARWorldMap.self, from: verifyData) else {
+                        throw NSError(domain: "PipePinMap", code: 1, userInfo: [NSLocalizedDescriptionKey: "World map verification failed"])
+                    }
+                    guard SpatialMeshStore.exists(siteID: siteID), SpatialMeshStore.metadata(siteID: siteID) != nil else {
+                        throw NSError(domain: "PipePinMap", code: 2, userInfo: [NSLocalizedDescriptionKey: "Spatial mesh verification failed"])
+                    }
+
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+                    let bytes = (attrs?[.size] as? NSNumber)?.intValue ?? mapData.count
+
+                    Task { @MainActor in
+                        self.worldMapSaveInFlight = false
+                        self.hasSavedWorldMap = true
+                        self.hasSavedSpatialMesh = true
+                        self.mapSavedAt = Date()
+                        self.spatialMeshAnchorCount = metadata.anchorCount
+                        self.spatialMeshVertexCount = metadata.vertexCount
+                        self.spatialMeshFaceCount = metadata.faceCount
+                        self.spatialMeshSavedAt = metadata.savedAt
+                        self.mapFileSizeKB = max(1, bytes / 1024)
+                        self.spatialMapSaveState = .saved
+                        self.statusText = "SITE MAP SAVED ✓ · relocalisation map + 3D mesh verified. You can now leave the Site."
+                        // Rendering the full debug wireframe costs GPU power. Once the
+                        // map is safely stored, hide X-Ray unless the user asks for it.
+                        self.setXRay(false)
+                    }
+                } catch {
+                    try? FileManager.default.removeItem(at: url)
+                    SpatialMeshStore.remove(siteID: siteID)
+                    Task { @MainActor in
+                        self.worldMapSaveInFlight = false
+                        self.hasSavedWorldMap = false
+                        self.hasSavedSpatialMesh = false
+                        self.spatialMapSaveState = .failed
+                        self.statusText = "SAVE FAILED · map was not verified and has been discarded. Try again after scanning more detail."
+                    }
                 }
             }
         }
+    }
+
+    // Kept for internal compatibility; the product now saves world + mesh together.
+    func saveSiteWorldMap(silent: Bool = false) {
+        if !silent { saveSpatialSiteMap() }
     }
 
     func relockToSavedMap() {
@@ -766,6 +856,9 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         spatialMeshAnchorCount = 0
         spatialMeshVertexCount = 0
         spatialMeshFaceCount = 0
+        mapFileSizeKB = 0
+        spatialMapSaveState = .unsaved
+        siteAlignmentReady = false
         statusText = "Saved spatial site map removed."
     }
 
@@ -773,15 +866,22 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         guard let siteID = markerStore?.activeSiteID else {
             hasSavedWorldMap = false
             hasSavedSpatialMesh = false
+            spatialMapSaveState = .unsaved
             return
         }
-        hasSavedWorldMap = FileManager.default.fileExists(atPath: worldMapURL(siteID: siteID).path)
-        hasSavedSpatialMesh = SpatialMeshStore.exists(siteID: siteID)
+        let mapURL = worldMapURL(siteID: siteID)
+        hasSavedWorldMap = FileManager.default.fileExists(atPath: mapURL.path) && loadWorldMap(siteID: siteID) != nil
+        hasSavedSpatialMesh = SpatialMeshStore.exists(siteID: siteID) && SpatialMeshStore.metadata(siteID: siteID) != nil
+        spatialMapSaveState = (hasSavedWorldMap && hasSavedSpatialMesh) ? .saved : .unsaved
         if let metadata = SpatialMeshStore.metadata(siteID: siteID) {
             spatialMeshAnchorCount = metadata.anchorCount
             spatialMeshVertexCount = metadata.vertexCount
             spatialMeshFaceCount = metadata.faceCount
             spatialMeshSavedAt = metadata.savedAt
+        }
+        if let attrs = try? FileManager.default.attributesOfItem(atPath: mapURL.path) {
+            if let bytes = attrs[.size] as? NSNumber { mapFileSizeKB = max(1, bytes.intValue / 1024) }
+            if let modified = attrs[.modificationDate] as? Date { mapSavedAt = modified }
         }
     }
 
@@ -1103,6 +1203,19 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         }
 
         Task { @MainActor in
+            // ARKit keeps tracking at the camera rate, but PipePin does not need to
+            // republish diagnostics / inspect mesh health every frame. Cap our app-side
+            // work to ~15 Hz to reduce SwiftUI redraws, CPU use and heat.
+            if let last = self.lastProcessedFrameTimestamp, timestamp - last < 0.066 { return }
+            self.lastProcessedFrameTimestamp = timestamp
+            switch ProcessInfo.processInfo.thermalState {
+            case .nominal: self.thermalText = "Nominal"
+            case .fair: self.thermalText = "Warm"
+            case .serious: self.thermalText = "Hot"
+            case .critical: self.thermalText = "Critical"
+            @unknown default: self.thermalText = "Unknown"
+            }
+
             let previousPosition = self.previousFramePosition
             let previousTimestamp = self.previousFrameTimestamp
             if let previousPosition, let previousTimestamp {
@@ -1134,7 +1247,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             var maxDrift: Float = 0
             var cautionDrift = false
             var severeDrift = false
-            for update in anchorUpdates {
+            for update in anchorUpdates where self.siteAlignmentReady || !self.loadedSavedMapForSession {
                 guard let saved = self.markerStore?.visibleMarkers.first(where: { $0.id == update.markerID }) else { continue }
                 let priorObserved = self.lastObservedAnchorPositions[update.markerID] ?? saved.position
                 let step = simd_distance(priorObserved, update.position)
@@ -1172,9 +1285,23 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                 trackingNormal = true
                 self.normalFrameStreak += 1
                 self.limitedTrackingBeganAt = nil
-                if self.wasRelocalizing {
-                    self.wasRelocalizing = false
-                    self.statusText = "Site position relocked against the spatial map."
+
+                if self.relocalizationRequired {
+                    // A saved Site's beams remain hidden until ARKit has reconciled the
+                    // camera with the loaded world map. Normal tracking after a visible
+                    // relocalising phase (or a sustained normal streak) is our handoff.
+                    if self.relocalizationSeen || self.normalFrameStreak >= 30 {
+                        self.siteAlignmentReady = true
+                        self.relocalizationRequired = false
+                        self.wasRelocalizing = false
+                        self.statusText = "SITE LOCKED ✓ · saved coordinate system restored."
+                    }
+                } else if !self.hasUnsafePinsWithoutMap {
+                    self.siteAlignmentReady = true
+                    if self.wasRelocalizing {
+                        self.wasRelocalizing = false
+                        self.statusText = "Site position relocked against the spatial map."
+                    }
                 }
             case .notAvailable:
                 self.trackingText = "Tracking unavailable"
@@ -1193,6 +1320,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                 case .relocalizing:
                     self.trackingText = "Relocalizing"
                     self.wasRelocalizing = true
+                    self.relocalizationSeen = true
                 @unknown default:
                     self.trackingText = "Tracking limited"
                 }
@@ -1219,11 +1347,11 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             // or genuinely large coordinate failure.
             if self.positionTrust != .lost {
                 let limitedDuration = self.limitedTrackingBeganAt.map { Date().timeIntervalSince($0) } ?? 0
-                if limitedDuration > 8.0 && !trackingNormal {
+                if limitedDuration > 12.0 && !trackingNormal {
                     self.positionTrust = .lost
                     self.positionIntegrityLost = true
                     self.statusText = "POSITION LOST · tracking has not recovered. Re-lock to the saved spatial map."
-                } else if trackingNormal && !cautionDrift && (mappingStatus == .extending || mappingStatus == .mapped) && self.normalFrameStreak >= 12 {
+                } else if trackingNormal && self.siteAlignmentReady && !cautionDrift && (mappingStatus == .extending || mappingStatus == .mapped || self.loadedSavedMapForSession) && self.normalFrameStreak >= 12 {
                     self.positionTrust = .locked
                 } else {
                     self.positionTrust = .caution
@@ -1233,8 +1361,9 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                 }
             }
 
-            self.markersReliable = self.positionTrust == .locked
-            self.setMarkerVisibility(self.positionTrust != .lost)
+            let alignmentAllowsPins = self.siteAlignmentReady && !self.hasUnsafePinsWithoutMap
+            self.markersReliable = self.positionTrust == .locked && alignmentAllowsPins
+            self.setMarkerVisibility(self.positionTrust != .lost && alignmentAllowsPins)
 
             self.updateAutoTorch()
 
