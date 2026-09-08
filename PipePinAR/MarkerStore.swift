@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import simd
 
 @MainActor
 final class MarkerStore: ObservableObject {
@@ -33,16 +34,16 @@ final class MarkerStore: ObservableObject {
         }
         if migrated { save() }
 
-        if let selectedMarkerID,
-           visibleMarkers.contains(where: { $0.id == selectedMarkerID }) {
-            return
-        }
-        selectedMarkerID = visibleMarkers.last?.id
+        // Entering a site starts in recording mode. A locate target is only shown
+        // after the user explicitly chooses a service from Pins.
+        selectedMarkerID = nil
     }
 
     func add(_ marker: SavedMarker) {
         markers.append(marker)
-        selectedMarkerID = marker.id
+        // Do not auto-select newly recorded pins. Selection is reserved for an
+        // explicit Locate action from the Pins list.
+        selectedMarkerID = nil
         save()
     }
 
@@ -53,7 +54,7 @@ final class MarkerStore: ObservableObject {
         }
         markers.removeAll { ids.contains($0.id) }
         if let selectedMarkerID, ids.contains(selectedMarkerID) {
-            self.selectedMarkerID = visibleMarkers.last?.id
+            self.selectedMarkerID = nil
         }
         save()
     }
@@ -62,8 +63,17 @@ final class MarkerStore: ObservableObject {
         guard let last = visibleMarkers.last else { return }
         markers.removeAll { $0.id == last.id }
         if selectedMarkerID == last.id {
-            selectedMarkerID = visibleMarkers.last?.id
+            selectedMarkerID = nil
         }
+        save()
+    }
+
+
+    func updatePosition(markerID: UUID, position: SIMD3<Float>) {
+        guard let index = markers.firstIndex(where: { $0.id == markerID }) else { return }
+        markers[index].x = position.x
+        markers[index].y = position.y
+        markers[index].z = position.z
         save()
     }
 
@@ -89,6 +99,6 @@ final class MarkerStore: ObservableObject {
         guard let data = UserDefaults.standard.data(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([SavedMarker].self, from: data) else { return }
         markers = decoded
-        selectedMarkerID = decoded.last?.id
+        selectedMarkerID = nil
     }
 }

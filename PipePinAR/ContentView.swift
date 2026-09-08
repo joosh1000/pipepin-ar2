@@ -3,6 +3,7 @@ import SwiftUI
 struct ContentView: View {
     @StateObject private var siteStore = SiteStore()
     @StateObject private var markerStore = MarkerStore()
+    @StateObject private var areaStore = SiteAreaStore()
     @StateObject private var arController = ARSessionController()
     @State private var selectedSite: SiteRecord?
 
@@ -12,6 +13,7 @@ struct ContentView: View {
                 ARWorkspaceView(
                     site: selectedSite,
                     markerStore: markerStore,
+                    areaStore: areaStore,
                     arController: arController,
                     onChangeSite: {
                         self.selectedSite = nil
@@ -24,12 +26,14 @@ struct ContentView: View {
                 SitesHomeView(
                     siteStore: siteStore,
                     markerStore: markerStore,
+                    areaStore: areaStore,
                     onSelect: { site in
                         markerStore.activate(siteID: site.id)
                         selectedSite = site
                     },
                     onDelete: { site in
                         markerStore.deleteMarkers(for: site.id)
+                        areaStore.deleteAreas(for: site.id)
                         siteStore.delete(site)
                     }
                 )
@@ -42,6 +46,7 @@ struct ContentView: View {
 struct SitesHomeView: View {
     @ObservedObject var siteStore: SiteStore
     @ObservedObject var markerStore: MarkerStore
+    @ObservedObject var areaStore: SiteAreaStore
     let onSelect: (SiteRecord) -> Void
     let onDelete: (SiteRecord) -> Void
 
@@ -175,7 +180,7 @@ struct SitesHomeView: View {
                     Text("PIPEPIN")
                         .font(.system(size: 18, weight: .heavy, design: .rounded))
                         .tracking(2.0)
-                    Text("0.4")
+                    Text("0.5")
                         .font(.system(size: 8, weight: .heavy, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -351,6 +356,7 @@ struct CreateSiteView: View {
 struct ARWorkspaceView: View {
     let site: SiteRecord
     @ObservedObject var markerStore: MarkerStore
+    @ObservedObject var areaStore: SiteAreaStore
     @ObservedObject var arController: ARSessionController
     let onChangeSite: () -> Void
 
@@ -359,6 +365,8 @@ struct ARWorkspaceView: View {
     @State private var selectedFlow: FlowDirection = .none
     @State private var showPins = false
     @State private var showScan = false
+    @State private var showAreas = false
+    @State private var selectedAreaID: UUID?
 
     var body: some View {
         ZStack {
@@ -392,6 +400,21 @@ struct ARWorkspaceView: View {
         .sheet(isPresented: $showScan) {
             ScanView(site: site, store: markerStore, controller: arController)
         }
+        .sheet(isPresented: $showAreas) {
+            AreasView(site: site, areaStore: areaStore, selectedAreaID: $selectedAreaID)
+        }
+        .onAppear {
+            if selectedAreaID == nil {
+                selectedAreaID = areaStore.ensureDefault(for: site.id).id
+            }
+            arController.refreshSavedMapState()
+        }
+    }
+
+    private var selectedArea: SiteArea? {
+        let areas = areaStore.areas(for: site.id)
+        if let selectedAreaID, let match = areas.first(where: { $0.id == selectedAreaID }) { return match }
+        return areas.first
     }
 
     private var premiumHeader: some View {
@@ -417,7 +440,7 @@ struct ARWorkspaceView: View {
                                 .lineLimit(1)
                             HStack(spacing: 5) {
                                 Text("PIPEPIN")
-                                Text("0.4")
+                                Text("0.5")
                             }
                             .font(.system(size: 8, weight: .heavy, design: .rounded))
                             .tracking(1.0)
@@ -430,9 +453,9 @@ struct ARWorkspaceView: View {
                 Spacer()
 
                 statusPill(
-                    title: arController.trackingText,
-                    icon: "viewfinder",
-                    good: arController.trackingText == "Tracking good"
+                    title: arController.precisionText,
+                    icon: "scope",
+                    good: arController.precisionReady
                 )
 
                 statusPill(
@@ -440,6 +463,21 @@ struct ARWorkspaceView: View {
                     icon: "move.3d",
                     good: arController.lidarAvailable
                 )
+
+                Button {
+                    switch arController.torchSetting {
+                    case .auto: arController.setTorch(.on)
+                    case .on: arController.setTorch(.off)
+                    case .off: arController.setTorch(.auto)
+                    }
+                } label: {
+                    Image(systemName: arController.torchIsOn ? "flashlight.on.fill" : "flashlight.off.fill")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(arController.torchIsOn ? Color.yellow : Color.white.opacity(0.72))
+                        .frame(width: 30, height: 28)
+                        .background(.black.opacity(0.30), in: Capsule())
+                }
+                .buttonStyle(.plain)
             }
 
             HStack(spacing: 7) {
@@ -454,6 +492,19 @@ struct ARWorkspaceView: View {
                     .lineLimit(1)
 
                 Spacer()
+
+                Button {
+                    showAreas = true
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "square.3.layers.3d")
+                        Text(selectedArea?.displayName ?? "Set area")
+                            .lineLimit(1)
+                    }
+                    .font(.system(size: 8, weight: .heavy, design: .rounded))
+                    .foregroundStyle(Color.cyan)
+                }
+                .buttonStyle(.plain)
 
                 HStack(spacing: 5) {
                     Image(systemName: selectedOrientation.systemImage)
@@ -519,7 +570,29 @@ struct ARWorkspaceView: View {
 
     @ViewBuilder
     private var targetHUD: some View {
-        if let marker = markerStore.selectedMarker,
+        if !arController.markersReliable && !markerStore.visibleMarkers.isEmpty {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.triangle.fill")
+                    .foregroundStyle(Color.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("POSITION UNCERTAIN")
+                        .font(.system(size: 11, weight: .heavy, design: .rounded))
+                        .tracking(0.7)
+                    Text("Service beams are hidden until ARKit relocks. Scan the surroundings or use Re-lock in Precision & Mapping.")
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.58))
+                        .lineLimit(2)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay {
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.orange.opacity(0.34), lineWidth: 1)
+            }
+            .padding(.bottom, 8)
+        } else if let marker = markerStore.selectedMarker,
            let horizontal = arController.horizontalDistance,
            let vertical = arController.verticalDifference {
             HStack(spacing: 12) {
@@ -558,13 +631,22 @@ struct ARWorkspaceView: View {
 
                 Spacer()
 
-                VStack(alignment: .trailing, spacing: 1) {
+                VStack(alignment: .trailing, spacing: 5) {
                     Text(String(format: "%.2f m", horizontal))
                         .font(.system(size: 20, weight: .bold, design: .rounded).monospacedDigit())
                     Text(String(format: "%+.2f m VERTICAL", vertical))
                         .font(.system(size: 9, weight: .bold, design: .rounded).monospacedDigit())
                         .tracking(0.3)
                         .foregroundStyle(.white.opacity(0.50))
+
+                    Button {
+                        arController.stopLocating()
+                    } label: {
+                        Label("STOP LOCATE", systemImage: "xmark.circle.fill")
+                            .font(.system(size: 8, weight: .heavy, design: .rounded))
+                            .foregroundStyle(.white.opacity(0.72))
+                    }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(12)
@@ -665,7 +747,7 @@ struct ARWorkspaceView: View {
             if selectedOrientation == .horizontal {
                 HStack(spacing: 6) {
                     Image(systemName: "iphone.gen3")
-                    Text("Horizontal beam follows the phone's screen-left / screen-right direction when you pin. Line the phone up with the service run.")
+                    Text("Horizontal beam follows the direction the rear camera is facing when you pin. Aim the phone along the service run, then press Pin Service.")
                 }
                 .font(.system(size: 8, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.44))
@@ -684,17 +766,18 @@ struct ARWorkspaceView: View {
                     arController.placeMarkerAtCenter(
                         serviceType: selectedType,
                         orientation: selectedOrientation,
-                        flowDirection: selectedFlow
+                        flowDirection: selectedFlow,
+                        area: selectedArea
                     )
                 } label: {
                     HStack(spacing: 10) {
                         Image(systemName: "plus")
                             .font(.system(size: 18, weight: .heavy))
                         VStack(alignment: .leading, spacing: 1) {
-                            Text("PIN SERVICE")
+                            Text(arController.isPrecisionCapturing ? "HOLD STILL…" : "PRECISION PIN")
                                 .font(.system(size: 13, weight: .heavy, design: .rounded))
                                 .tracking(0.7)
-                            Text(pinSubtitle)
+                            Text(arController.isPrecisionCapturing ? "CAPTURING \(Int(arController.captureProgress * 100))%" : pinSubtitle)
                                 .font(.system(size: 8, weight: .heavy, design: .rounded))
                                 .tracking(0.6)
                                 .lineLimit(1)
@@ -704,12 +787,12 @@ struct ARWorkspaceView: View {
                         Image(systemName: selectedOrientation.systemImage)
                             .font(.system(size: 18, weight: .heavy))
                     }
-                    .foregroundStyle(.black)
+                    .foregroundStyle(arController.precisionReady || arController.isPrecisionCapturing ? Color.black : Color.white.opacity(0.66))
                     .padding(.horizontal, 16)
                     .frame(maxWidth: .infinity)
                     .frame(height: 58)
-                    .background(selectedType.tint, in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-                    .shadow(color: selectedType.tint.opacity(0.42), radius: 16, y: 6)
+                    .background(arController.precisionReady || arController.isPrecisionCapturing ? selectedType.tint : Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+                    .shadow(color: arController.precisionReady ? selectedType.tint.opacity(0.42) : .clear, radius: 16, y: 6)
                 }
                 .buttonStyle(.plain)
 
@@ -841,6 +924,20 @@ struct PinsView: View {
                                         }
                                         .font(.caption2.bold())
                                         .foregroundStyle(marker.serviceType.tint)
+                                        if !marker.floorName.isEmpty || !marker.roomName.isEmpty {
+                                            Text([marker.floorName, marker.roomName].filter { !$0.isEmpty }.joined(separator: " · "))
+                                                .font(.caption2.bold())
+                                                .foregroundStyle(.secondary)
+                                        }
+                                        HStack(spacing: 6) {
+                                            Text(marker.pinSource.title)
+                                            if marker.captureConfidence > 0 {
+                                                Text("•")
+                                                Text("confidence \(marker.captureConfidence)/2")
+                                            }
+                                        }
+                                        .font(.caption2)
+                                        .foregroundStyle(.secondary)
                                         Text(marker.createdAt, format: .dateTime.hour().minute().day().month())
                                             .font(.caption2)
                                             .foregroundStyle(.secondary)
@@ -881,45 +978,116 @@ struct ScanView: View {
     var body: some View {
         NavigationStack {
             Form {
-                Section("Current site") {
-                    LabeledContent("Site", value: site.name)
-                    if !site.reference.isEmpty {
-                        LabeledContent("Reference", value: site.reference)
+                Section("Precision status") {
+                    LabeledContent("Precision", value: controller.precisionText)
+                    LabeledContent("Tracking", value: controller.trackingText)
+                    LabeledContent("World map", value: controller.mappingText)
+                    LabeledContent("Beams trustworthy", value: controller.markersReliable ? "Yes" : "Hidden / uncertain")
+
+                    if controller.isPrecisionCapturing {
+                        ProgressView(value: controller.captureProgress)
+                        Button("Cancel precision capture", role: .cancel) {
+                            controller.cancelPrecisionCapture()
+                        }
                     }
-                    if !site.address.isEmpty {
-                        Text(site.address)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    LabeledContent("Service pins", value: "\(store.visibleMarkers.count)")
                 }
 
-                Section("Spatial tracking") {
-                    LabeledContent("Tracking", value: controller.trackingText)
+                Section("LiDAR target") {
                     LabeledContent("LiDAR", value: controller.lidarAvailable ? "Available / active" : "Not available")
+                    LabeledContent("Centre depth", value: controller.depthDistance.map { String(format: "%.2f m", $0) } ?? "No reading")
+                    LabeledContent("Depth confidence", value: "\(controller.depthConfidence) / 2")
                     LabeledContent("Mapped surfaces", value: "\(controller.mappedSurfaceCount)")
+                    LabeledContent("Last pin source", value: controller.lastPinSourceText)
 
                     Button {
                         controller.toggleLiDARMesh()
                     } label: {
-                        Label(
-                            controller.lidarMeshVisible ? "Hide LiDAR mesh" : "Show LiDAR mesh",
-                            systemImage: "move.3d"
-                        )
+                        Label(controller.lidarMeshVisible ? "Hide LiDAR mesh" : "Show LiDAR mesh", systemImage: "move.3d")
                     }
                     .disabled(!controller.lidarAvailable)
                 }
 
+                Section("Light & movement") {
+                    LabeledContent("Ambient light", value: String(format: "%.0f", controller.ambientLight))
+                    LabeledContent("Low light", value: controller.lowLight ? "Yes" : "No")
+                    LabeledContent("Phone speed", value: String(format: "%.2f m/s", controller.motionSpeed))
+
+                    Picker("Torch", selection: Binding(
+                        get: { controller.torchSetting },
+                        set: { controller.setTorch($0) }
+                    )) {
+                        ForEach(TorchSetting.allCases) { setting in
+                            Text(setting.rawValue).tag(setting)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+
+                    Text("Auto uses the continuous rear torch when PipePin detects low light. LiDAR can still measure in darkness, but extra camera detail can help visual tracking and relocalisation.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Saved Site Map") {
+                    LabeledContent("Saved map", value: controller.hasSavedWorldMap ? "Available" : "Not saved")
+                    if let mapSavedAt = controller.mapSavedAt {
+                        LabeledContent("Saved", value: mapSavedAt.formatted(date: .abbreviated, time: .shortened))
+                    }
+
+                    Button {
+                        controller.saveSiteWorldMap()
+                    } label: {
+                        Label("Save / update Site Map", systemImage: "square.and.arrow.down")
+                    }
+
+                    Button {
+                        controller.relockToSavedMap()
+                    } label: {
+                        Label("Re-lock to saved Site Map", systemImage: "scope")
+                    }
+                    .disabled(!controller.hasSavedWorldMap)
+
+                    Text("If PipePin loses position between rooms, it now hides the beams instead of confidently showing a potentially wrong location. Re-lock loads the saved AR world map and waits for the environment to be recognised again.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Section("Accuracy test") {
+                    if let last = store.visibleMarkers.last {
+                        Text("Return to the physical point used for \(last.name), aim the centre reticle at exactly the same point, then run the check.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+
+                        Button {
+                            controller.beginAccuracyCheck(marker: last)
+                            dismiss()
+                        } label: {
+                            Label("Check \(last.name) return accuracy", systemImage: "ruler")
+                        }
+                    } else {
+                        Text("Create at least one precision pin first.")
+                            .foregroundStyle(.secondary)
+                    }
+
+                    if let mm = controller.accuracyResultMM {
+                        LabeledContent("Last measured error", value: "\(mm) mm")
+                    }
+                }
+
                 Section("Locator beam length") {
                     LabeledContent("Current beam length", value: "\(Int(controller.beamLength)) m")
-
                     HStack(spacing: 10) {
                         beamButton("6 m", value: 6)
                         beamButton("12 m", value: 12)
                         beamButton("20 m", value: 20)
                     }
+                }
 
-                    Text("The same length is used for vertical and horizontal locator beams. Vertical beams are useful for transferring a point through floors; horizontal beams show a service run.")
+                Section("Diagnostics") {
+                    Text(controller.diagnosticSummary)
+                        .font(.system(.caption, design: .monospaced))
+                    LabeledContent("Tracking interruptions", value: "\(controller.interruptionCount)")
+                    LabeledContent("Re-lock attempts", value: "\(controller.relocalizationCount)")
+                    Text("This diagnostic block is intentionally exposed in the test build so we can correlate a beam jump with what ARKit thought was happening at that moment.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -933,19 +1101,19 @@ struct ScanView: View {
                     .disabled(store.visibleMarkers.isEmpty)
 
                     Button {
-                        controller.startSession(reset: false)
+                        controller.startSession(reset: false, preferSavedMap: false)
                     } label: {
-                        Label("Refresh AR configuration", systemImage: "arrow.clockwise")
+                        Label("Refresh current AR session", systemImage: "arrow.clockwise")
                     }
                 }
 
                 Section {
-                    Text("0.4 adds site-first organisation, vertical/horizontal service runs and optional directional arrows. The site structure is ready for future saved room scans and 3D building maps.")
+                    Text("PipePin 0.5 Precision Mapping. The priority of this build is measurement confidence rather than adding more visual features.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
             }
-            .navigationTitle("Scan & Spatial")
+            .navigationTitle("Precision & Mapping")
             .toolbar {
                 ToolbarItem(placement: .topBarTrailing) {
                     Button("Done") { dismiss() }
@@ -969,5 +1137,82 @@ struct ScanView: View {
                 )
         }
         .buttonStyle(.plain)
+    }
+}
+
+struct AreasView: View {
+    @Environment(\.dismiss) private var dismiss
+    let site: SiteRecord
+    @ObservedObject var areaStore: SiteAreaStore
+    @Binding var selectedAreaID: UUID?
+
+    @State private var floorName = "Ground Floor"
+    @State private var roomName = ""
+
+    var siteAreas: [SiteArea] { areaStore.areas(for: site.id) }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section("Current mapping area") {
+                    ForEach(siteAreas) { area in
+                        Button {
+                            selectedAreaID = area.id
+                            dismiss()
+                        } label: {
+                            HStack {
+                                VStack(alignment: .leading, spacing: 3) {
+                                    Text(area.floorName)
+                                        .font(.headline)
+                                    Text(area.roomName)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer()
+                                if area.id == selectedAreaID {
+                                    Image(systemName: "checkmark.circle.fill")
+                                        .foregroundStyle(Color.cyan)
+                                }
+                            }
+                        }
+                    }
+                    .onDelete { offsets in
+                        let current = siteAreas
+                        for index in offsets where current.indices.contains(index) {
+                            let area = current[index]
+                            areaStore.delete(area)
+                            if selectedAreaID == area.id {
+                                selectedAreaID = areaStore.ensureDefault(for: site.id).id
+                            }
+                        }
+                    }
+                }
+
+                Section("Add floor / room") {
+                    TextField("Floor, e.g. First Floor", text: $floorName)
+                    TextField("Room, e.g. Plant Room", text: $roomName)
+                    Button {
+                        let area = areaStore.add(siteID: site.id, floorName: floorName, roomName: roomName)
+                        selectedAreaID = area.id
+                        roomName = ""
+                    } label: {
+                        Label("Add mapping area", systemImage: "plus")
+                    }
+                }
+
+                Section {
+                    Text("Every new service pin is tagged to the selected Site, Floor and Room. This is also the hierarchy PipePin will use for future multi-room and 3D building maps.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .navigationTitle("Floor & Room")
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Button("Done") { dismiss() }
+                }
+            }
+        }
+        .preferredColorScheme(.dark)
     }
 }

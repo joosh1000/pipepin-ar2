@@ -1,29 +1,37 @@
-# PipePin Native ARKit 0.4 — Sites + Directional Beams
+# PipePin Native ARKit 0.5 — Precision Mapping
 
-Native iPhone ARKit / RealityKit prototype.
+Accuracy-first native iPhone test build.
 
-## Added in 0.4
+## New in 0.5
 
-- Site-first home screen: create/select a building or job before entering AR.
-- Site name, optional address and Job ID/reference stored locally on the iPhone.
-- Service pins are grouped by site.
-- Existing 0.3.x test pins are migrated to the first site opened after installing 0.4.
-- Vertical and horizontal service beam modes.
-- Horizontal beam direction is captured from the phone's screen-left/screen-right axis at the moment the pin is placed.
-- Optional direction metadata: No arrows / Up or Down for vertical runs / Forward or Reverse for horizontal runs.
-- Repeated white chevron arrows are rendered along directional beams.
-- Stronger service colours, beam halo and target glow.
-- 6 m / 12 m / 20 m locator beam lengths remain available.
-- LiDAR mesh debug view remains available on supported iPhones.
+- Precision Pin no longer relies on a single AR raycast when LiDAR depth is available.
+- Centre-reticle LiDAR depth sampling uses a confidence-filtered patch and collects 10 stable frames before committing a pin.
+- Low-confidence depth, fast phone movement, poor tracking and low-light states block precision capture instead of silently creating a questionable pin.
+- Continuous torch control: Auto / On / Off.
+- Explicit ARKit service anchors are added for pinned services.
+- Site ARWorldMap can be saved, loaded and used for re-lock/relocalisation.
+- Existing service beams are hidden whenever tracking is considered unreliable rather than continuing to show a confidently wrong position.
+- Site hierarchy now includes Floor + Room mapping areas; new pins are tagged to the active area.
+- Reference snapshot is stored locally when a precision pin is created.
+- Accuracy Test: return to the original physical point, aim at it again and measure the 3D error in millimetres.
+- Diagnostics expose tracking, world-map state, LiDAR depth/confidence, motion speed, low light and interruption/re-lock counts.
+- Existing 0.4.1 fixes remain: no unwanted extra Locate target; horizontal beams use the rear camera's forward direction.
+
+## First test sequence
+
+1. Select/create a Site.
+2. Tap the Floor/Room label in the AR header and choose/create an area.
+3. Slowly scan the room until `PRECISION READY` appears.
+4. In **Precision & Mapping**, leave Torch on Auto and confirm LiDAR confidence reaches 1/2 or 2/2 on the target.
+5. Aim at a known service point and tap **PRECISION PIN**. Hold still while the 10-frame capture completes.
+6. Save/update the Site Map once the room is mapped well.
+7. Walk into another room/floor. If tracking becomes uncertain, PipePin should hide service beams instead of moving them.
+8. Use **Re-lock to saved Site Map**, scan recognisable surroundings and wait for the beams to reappear.
+9. Return to the original physical point and use **Accuracy Test** to record the error in millimetres.
 
 ## Important prototype limitation
 
-Site grouping is now persistent, but a full persistent AR world map / LiDAR building model is not implemented yet. ARKit world coordinates can move between fresh AR sessions. The next mapping phase should save/relocalize a site's spatial map before treating old service coordinates as permanent survey data.
+0.5 materially improves capture quality and relocalisation behaviour, but it does not turn an iPhone into survey equipment. The purpose of this build is to measure how much drift remains across rooms/floors and determine whether phone-only positioning is accurate enough for the PipePin use case.
 
-## Install / build
-
-Copy this folder over the cloned GitHub repository using GitHub Desktop, commit and push. The included GitHub Action builds:
-
-`PipePinAR-0.4-unsigned.ipa`
-
-Install it with Sideloadly using the same free Apple developer test workflow as previous builds.
+Build artifact: `PipePinAR-0.5-iPhone-build`
+IPA: `PipePinAR-0.5-unsigned.ipa`

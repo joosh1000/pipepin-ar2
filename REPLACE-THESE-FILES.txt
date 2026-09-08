@@ -1,15 +1,12 @@
-For GitHub Desktop, copy EVERYTHING inside this folder over your cloned pipepin-ar2 folder and choose Replace.
+For GitHub Desktop: copy EVERYTHING inside this folder over the cloned pipepin-ar2 repository and choose Replace.
 
 Important changed/new files:
-PipePinAR/ContentView.swift
-PipePinAR/ARSessionController.swift
-PipePinAR/Marker.swift
-PipePinAR/MarkerStore.swift
-PipePinAR/Site.swift          (NEW)
-PipePinAR/SiteStore.swift     (NEW)
-project.yml
-.github/workflows/build-unsigned-ipa.yml
+- PipePinAR/ARSessionController.swift
+- PipePinAR/ContentView.swift
+- PipePinAR/Marker.swift
+- PipePinAR/SiteArea.swift (NEW)
+- PipePinAR/SiteAreaStore.swift (NEW)
+- project.yml
+- .github/workflows/build-unsigned-ipa.yml
 
-Expected app badge/version: 0.4
-Expected GitHub artifact: PipePinAR-0.4-iPhone-build
-Expected IPA: PipePinAR-0.4-unsigned.ipa
+Then Commit to main -> Push origin -> Actions -> Build PipePin iPhone IPA -> Run workflow.
