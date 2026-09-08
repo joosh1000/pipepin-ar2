@@ -70,6 +70,9 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     private var normalFrameStreak = 0
     private var loadedSavedMapForSession = false
     private var wasRelocalizing = false
+    private var snapshotInFlight = false
+    private var worldMapSaveInFlight = false
+    private var lastTorchChange = Date.distantPast
 
     private struct PendingPin {
         let serviceType: ServiceType
@@ -258,8 +261,10 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         selectMarker(nil)
         lastPinSourceText = source.title
         statusText = "\(marker.name) precision-locked · \(source.title)."
+        // Reference image is lightweight context; the potentially large ARWorldMap
+        // is now saved only when the user explicitly taps Save Site Map. Archiving a
+        // LiDAR world map after every pin could cause overlapping memory spikes.
         saveReferenceSnapshot(markerID: marker.id)
-        saveSiteWorldMap(silent: true)
     }
 
     func beginAccuracyCheck(marker: SavedMarker) {
@@ -424,17 +429,21 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func applyTorch(on: Bool) {
+        guard torchIsOn != on else { return }
+        let now = Date()
+        guard now.timeIntervalSince(lastTorchChange) > 0.8 else { return }
         guard let device = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back),
               device.hasTorch else { return }
         do {
             try device.lockForConfiguration()
+            defer { device.unlockForConfiguration() }
             if on {
                 try device.setTorchModeOn(level: min(0.55, AVCaptureDevice.maxAvailableTorchLevel))
             } else {
                 device.torchMode = .off
             }
-            device.unlockForConfiguration()
             torchIsOn = on
+            lastTorchChange = now
         } catch {
             statusText = "Torch could not be changed while AR is active."
         }
@@ -442,6 +451,10 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
     func saveSiteWorldMap(silent: Bool = false) {
         guard let arView, let siteID = markerStore?.activeSiteID else { return }
+        guard !worldMapSaveInFlight else {
+            if !silent { statusText = "Site map save already in progress." }
+            return
+        }
         if anchorDriftAlarm {
             if !silent { statusText = "Map save blocked · resolve the anchor-shift warning first." }
             return
@@ -450,10 +463,12 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             markerStore?.updatePosition(markerID: id, position: position)
         }
         let url = worldMapURL(siteID: siteID)
+        worldMapSaveInFlight = true
         arView.session.getCurrentWorldMap { [weak self] worldMap, error in
             guard let self else { return }
             guard let worldMap, error == nil else {
                 Task { @MainActor in
+                    self.worldMapSaveInFlight = false
                     if !silent { self.statusText = "Site map not ready yet · keep scanning and try again." }
                 }
                 return
@@ -464,12 +479,14 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                 try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
                 try data.write(to: url, options: .atomic)
                 Task { @MainActor in
+                    self.worldMapSaveInFlight = false
                     self.hasSavedWorldMap = true
                     self.mapSavedAt = Date()
                     if !silent { self.statusText = "Site spatial map saved for relocalisation." }
                 }
             } catch {
                 Task { @MainActor in
+                    self.worldMapSaveInFlight = false
                     if !silent { self.statusText = "Could not save the site spatial map." }
                 }
             }
@@ -523,12 +540,19 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     }
 
     private func saveReferenceSnapshot(markerID: UUID) {
-        guard let arView else { return }
+        guard let arView, !snapshotInFlight else { return }
+        snapshotInFlight = true
         let url = referenceSnapshotURL(markerID: markerID)
-        arView.snapshot(saveToHDR: false) { image in
-            guard let image, let data = image.jpegData(compressionQuality: 0.72) else { return }
-            try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
-            try? data.write(to: url, options: .atomic)
+        arView.snapshot(saveToHDR: false) { [weak self] image in
+            autoreleasepool {
+                if let image, let data = image.jpegData(compressionQuality: 0.60) {
+                    try? FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true, attributes: nil)
+                    try? data.write(to: url, options: .atomic)
+                }
+            }
+            Task { @MainActor in
+                self?.snapshotInFlight = false
+            }
         }
     }
 
@@ -718,19 +742,40 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         return DepthFrameSample(distance: values[values.count / 2], confidence: high.isEmpty ? 1 : 2)
     }
 
+    // ARDepthData stores depth along the camera Z axis. Convert the centre-image
+    // depth sample using the calibrated camera intrinsics rather than simply moving
+    // straight down camera.forward. The principal point is not guaranteed to be
+    // mathematically identical to the image centre, so this removes a real source
+    // of centimetre-scale aiming offset.
+    nonisolated private static func centreDepthWorldPosition(from frame: ARFrame, depth: Float) -> SIMD3<Float>? {
+        guard depth.isFinite, depth > 0.10 else { return nil }
+        let intrinsics = frame.camera.intrinsics
+        let resolution = frame.camera.imageResolution
+        let fx = intrinsics.columns.0.x
+        let fy = intrinsics.columns.1.y
+        let px = intrinsics.columns.2.x
+        let py = intrinsics.columns.2.y
+        guard fx > 0, fy > 0 else { return nil }
+
+        let u = Float(resolution.width) * 0.5
+        let v = Float(resolution.height) * 0.5
+        let cameraX = (u - px) / fx * depth
+        let cameraY = -(v - py) / fy * depth
+        let cameraPoint = SIMD4<Float>(cameraX, cameraY, -depth, 1)
+        let worldPoint = frame.camera.transform * cameraPoint
+        return SIMD3<Float>(worldPoint.x, worldPoint.y, worldPoint.z)
+    }
+
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let transform = frame.camera.transform
         let position = SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
-        let forwardRaw = SIMD3<Float>(-transform.columns.2.x, -transform.columns.2.y, -transform.columns.2.z)
-        let forwardLength = simd_length(forwardRaw)
-        let forward = forwardLength > 0.001 ? forwardRaw / forwardLength : SIMD3<Float>(0, 0, -1)
         let trackingState = frame.camera.trackingState
         let mappingStatus = frame.worldMappingStatus
         let timestamp = frame.timestamp
         let surfaceCount = frame.anchors.filter { $0 is ARMeshAnchor || $0 is ARPlaneAnchor }.count
         let light = frame.lightEstimate?.ambientIntensity ?? 1000
         let depthSample = Self.centreDepthSample(from: frame)
-        let depthWorldPosition = depthSample.map { position + forward * $0.distance }
+        let depthWorldPosition = depthSample.flatMap { Self.centreDepthWorldPosition(from: frame, depth: $0.distance) }
         let anchorUpdates: [AnchorFrameUpdate] = frame.anchors.compactMap { anchor in
             guard let name = anchor.name, name.hasPrefix("PipePinService-") else { return nil }
             let uuidText = String(name.dropFirst("PipePinService-".count))
@@ -853,6 +898,15 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             }
 
             self.updateGuide()
+        }
+    }
+
+    nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
+        let message = error.localizedDescription
+        Task { @MainActor in
+            self.markersReliable = false
+            self.setMarkerVisibility(false)
+            self.statusText = "AR session error · \(message)"
         }
     }
 

@@ -180,7 +180,7 @@ struct SitesHomeView: View {
                     Text("PIPEPIN")
                         .font(.system(size: 18, weight: .heavy, design: .rounded))
                         .tracking(2.0)
-                    Text("0.5")
+                    Text("0.5.1")
                         .font(.system(size: 8, weight: .heavy, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -381,10 +381,15 @@ struct ARWorkspaceView: View {
             .ignoresSafeArea()
             .allowsHitTesting(false)
 
+            // The reticle must be the exact geometric centre of the ARView.
+            // Do not place it inside the header/control VStack: that made the visible
+            // crosshair differ from the point ARKit/LiDAR sampled at screen centre.
+            targetReticle
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .center)
+                .allowsHitTesting(false)
+
             VStack(spacing: 0) {
                 premiumHeader
-                Spacer()
-                targetReticle
                 Spacer()
                 targetHUD
                 controlDeck

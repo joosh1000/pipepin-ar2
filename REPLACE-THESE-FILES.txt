@@ -1,12 +1,9 @@
-For GitHub Desktop: copy EVERYTHING inside this folder over the cloned pipepin-ar2 repository and choose Replace.
+PipePin 0.5.1 Aim + Stability Fix
 
-Important changed/new files:
-- PipePinAR/ARSessionController.swift
+Replace the cloned repo contents with this folder using GitHub Desktop.
+Important modified files:
 - PipePinAR/ContentView.swift
-- PipePinAR/Marker.swift
-- PipePinAR/SiteArea.swift (NEW)
-- PipePinAR/SiteAreaStore.swift (NEW)
+- PipePinAR/ARSessionController.swift
 - project.yml
 - .github/workflows/build-unsigned-ipa.yml
-
-Then Commit to main -> Push origin -> Actions -> Build PipePin iPhone IPA -> Run workflow.
+- README.md
