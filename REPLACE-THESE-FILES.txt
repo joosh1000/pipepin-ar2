@@ -1,9 +1,9 @@
-PipePin 0.5.1 Aim + Stability Fix
+PipePin 0.5.2 Ray-Lock + Frozen Coordinates
 
-Replace the cloned repo contents with this folder using GitHub Desktop.
-Important modified files:
-- PipePinAR/ContentView.swift
+Copy EVERYTHING in this folder over the cloned pipepin-ar2 repository and choose Replace files in destination.
+
+Important changed files:
 - PipePinAR/ARSessionController.swift
+- PipePinAR/ContentView.swift
 - project.yml
 - .github/workflows/build-unsigned-ipa.yml
-- README.md

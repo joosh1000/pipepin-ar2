@@ -1,27 +1,28 @@
-# PipePin Native ARKit 0.5.1 — Aim + Stability Fix
+# PipePin Native ARKit 0.5.2 — Ray-Lock + Frozen Coordinates
 
-Focused correction to the 0.5 Precision Mapping build after on-device testing.
+Focused accuracy correction after the 0.5.1 on-device screen recording.
 
-## Fixed
+## What changed
 
-- **Crosshair and AR target are now the same point.** In 0.5 the visible reticle sat inside a VStack between the header and controls, while ARKit/LiDAR always sampled the geometric centre of the ARView. The reticle is now independently overlaid at that exact centre.
-- **LiDAR centre-depth is calibrated with the AR camera intrinsics.** Depth is unprojected into world space rather than assuming the optical forward vector is exactly the image centre.
-- **No automatic ARWorldMap archive after every pin.** Site maps can be large with LiDAR scene reconstruction; they are now saved only from the explicit Save Site Map control.
-- World-map saves cannot overlap.
-- Reference snapshots cannot overlap and use lower JPEG memory.
-- Torch switching is debounced to avoid repeatedly reconfiguring the camera while ARKit is active.
-- AR session errors are surfaced in the HUD and beams are hidden rather than left looking trustworthy.
+- **Reticle ray is now the placement authority.** LiDAR depth is projected along RealityKit's exact `ARView.ray(through:)` ray through the visible centre crosshair, rather than rebuilding the 3D point from camera intrinsics.
+- **Aim validation before commit.** The calculated 3D point is projected back to screen. If it is more than 14 px away from the reticle, PipePin rejects the pin instead of drawing a beam in the wrong place.
+- **Capture spread validation.** Ten-frame precision captures with more than 55 mm spread are rejected as unstable.
+- **Live 3D aim probe.** A tiny green/white world-space point shows where PipePin currently believes the reticle lands. It should sit under the crosshair before a precision pin is accepted.
+- **Saved service XYZ is immutable.** ARKit anchor refinements are now used only as drift diagnostics. They no longer drag the visible beam or overwrite the saved service coordinate.
+- **Much tighter drift tripwire.** A service anchor shift above 25 mm frame-to-frame or 50 mm from its saved position freezes/hides beams and marks the site position unsafe.
+- **World-position jump detection.** A physically impossible camera-coordinate jump above 300 mm between frames freezes the beams.
+- **No silent recovery after integrity loss.** Once a position shift/jump is detected, the app keeps beams hidden until a deliberate Site Map re-lock.
+- **Saved map positions stay frozen.** Saving a Site Map no longer writes ARKit-adjusted anchor coordinates back over the original service pin coordinates.
 
-## First test
+## Test order
 
-1. Open a site and wait for Precision Ready.
-2. Aim the **white centre dot** at a small, obvious physical feature.
-3. Precision Pin it.
-4. Without moving much, verify the centre sphere appears on the same physical feature.
-5. Repeat at 0.5 m, 1 m, 2 m and 3 m if possible.
-6. Then test walking away / room transitions.
+1. Open one site and slowly scan until `PRECISION READY`.
+2. Aim at a distinctive point 0.5–2 m away. Confirm the tiny green/white 3D aim probe appears under the orange crosshair.
+3. Create one vertical precision pin. Its centre sphere should appear exactly at the aimed point.
+4. Move sideways in the same room. The beam should remain attached to the original physical point.
+5. Save the Site Map.
+6. Walk toward/through a doorway slowly while continuing to scan. If PipePin detects a coordinate shift, it should **hide the beam**, not move it.
+7. Use Re-lock to Site Map before trusting the beam again.
 
-If the app exits to the Home Screen again, retrieve the iOS crash report from **Settings → Privacy & Security → Analytics & Improvements → Analytics Data** and send the newest `PipePin...` or `JetsamEvent...` entry. `JetsamEvent` usually indicates iOS killed the app for memory pressure.
-
-Artifact: `PipePinAR-0.5.1-iPhone-build`
-IPA: `PipePinAR-0.5.1-unsigned.ipa`
+Artifact: `PipePinAR-0.5.2-iPhone-build`
+IPA: `PipePinAR-0.5.2-unsigned.ipa`

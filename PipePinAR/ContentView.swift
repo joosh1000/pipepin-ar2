@@ -180,7 +180,7 @@ struct SitesHomeView: View {
                     Text("PIPEPIN")
                         .font(.system(size: 18, weight: .heavy, design: .rounded))
                         .tracking(2.0)
-                    Text("0.5.1")
+                    Text("0.5.2")
                         .font(.system(size: 8, weight: .heavy, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -445,7 +445,7 @@ struct ARWorkspaceView: View {
                                 .lineLimit(1)
                             HStack(spacing: 5) {
                                 Text("PIPEPIN")
-                                Text("0.5")
+                                Text("0.5.2")
                             }
                             .font(.system(size: 8, weight: .heavy, design: .rounded))
                             .tracking(1.0)
@@ -1113,7 +1113,7 @@ struct ScanView: View {
                 }
 
                 Section {
-                    Text("PipePin 0.5 Precision Mapping. The priority of this build is measurement confidence rather than adding more visual features.")
+                    Text("PipePin 0.5.2 Ray-Lock. The priority of this build is reticle-true placement and immutable service coordinates.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

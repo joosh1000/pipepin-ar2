@@ -56,15 +56,20 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     @Published var interruptionCount = 0
     @Published var relocalizationCount = 0
     @Published var anchorDriftMM = 0
+    @Published var aimErrorPixels: Int?
+    @Published var aimSpreadMM = 0
+    @Published var positionIntegrityLost = false
 
     var markerStore: MarkerStore?
 
     private var markerEntities: [UUID: AnchorEntity] = [:]
     private var serviceAnchors: [UUID: ARAnchor] = [:]
     private var runtimeMarkerPositions: [UUID: SIMD3<Float>] = [:]
+    private var lastObservedAnchorPositions: [UUID: SIMD3<Float>] = [:]
     private var anchorDriftAlarm = false
     private var guideEntity: AnchorEntity?
     private var guideMarkerID: UUID?
+    private var aimPreviewEntity: AnchorEntity?
     private var previousFramePosition: SIMD3<Float>?
     private var previousFrameTimestamp: TimeInterval?
     private var normalFrameStreak = 0
@@ -91,7 +96,8 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
 
     var diagnosticSummary: String {
         let depth = depthDistance.map { String(format: "%.2f m", $0) } ?? "—"
-        return "Tracking: \(trackingText) · Map: \(mappingText) · Depth: \(depth) · Confidence: \(depthConfidence)/2 · Speed: \(String(format: "%.2f", motionSpeed)) m/s · Anchor drift: \(anchorDriftMM) mm"
+        let aim = aimErrorPixels.map { "\($0) px" } ?? "—"
+        return "Tracking: \(trackingText) · Map: \(mappingText) · Depth: \(depth) · Confidence: \(depthConfidence)/2 · Speed: \(String(format: "%.2f", motionSpeed)) m/s · Aim: \(aim) · Capture spread: \(aimSpreadMM) mm · Anchor drift: \(anchorDriftMM) mm"
     }
 
     func configure(_ view: ARView, markerStore: MarkerStore) {
@@ -146,7 +152,11 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         normalFrameStreak = 0
         anchorDriftAlarm = false
         anchorDriftMM = 0
+        aimErrorPixels = nil
+        aimSpreadMM = 0
+        positionIntegrityLost = false
         runtimeMarkerPositions.removeAll()
+        lastObservedAnchorPositions.removeAll()
         captureSamples.removeAll()
         pendingPin = nil
         pendingAccuracyMarker = nil
@@ -257,7 +267,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         )
 
         markerStore.add(marker)
-        addMarkerEntity(marker)
+        addMarkerEntity(marker, createSessionAnchor: true)
         selectMarker(nil)
         lastPinSourceText = source.title
         statusText = "\(marker.name) precision-locked · \(source.title)."
@@ -302,6 +312,28 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         let positions = captureSamples.map(\.position)
         let finalPosition = robustCentre(of: positions)
         let confidence = captureSamples.map(\.confidence).sorted()[captureSamples.count / 2]
+        let spread = positions.map { simd_distance($0, finalPosition) }.max() ?? 0
+        aimSpreadMM = Int((spread * 1000).rounded())
+
+        // A precision pin must be geometrically consistent with the visible reticle.
+        // If the sampled 3D point does not project back onto the centre target, reject
+        // it rather than drawing a confident beam somewhere else.
+        if let arView, let projected = arView.project(finalPosition) {
+            let centre = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+            let pixelError = hypot(projected.x - centre.x, projected.y - centre.y)
+            aimErrorPixels = Int(pixelError.rounded())
+            if pixelError > 14 || spread > 0.055 {
+                pendingPin = nil
+                pendingAccuracyMarker = nil
+                captureSamples.removeAll()
+                captureProgress = 0
+                isPrecisionCapturing = false
+                statusText = pixelError > 14
+                    ? "AIM MISMATCH · pin rejected. Hold the centre target on the service and try again."
+                    : "DEPTH UNSTABLE · pin rejected. Move closer and hold steadier."
+                return
+            }
+        }
 
         if let pin = pendingPin {
             commitMarker(
@@ -381,7 +413,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         serviceAnchors.values.forEach { arView.session.remove(anchor: $0) }
         serviceAnchors.removeAll()
         runtimeMarkerPositions.removeAll()
-        markerStore.visibleMarkers.forEach(addMarkerEntity)
+        markerStore.visibleMarkers.forEach { addMarkerEntity($0, createSessionAnchor: !loadedSavedMapForSession) }
         setMarkerVisibility(markersReliable)
         updateGuide()
     }
@@ -459,9 +491,6 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             if !silent { statusText = "Map save blocked · resolve the anchor-shift warning first." }
             return
         }
-        for (id, position) in runtimeMarkerPositions {
-            markerStore?.updatePosition(markerID: id, position: position)
-        }
         let url = worldMapURL(siteID: siteID)
         worldMapSaveInFlight = true
         arView.session.getCurrentWorldMap { [weak self] worldMap, error in
@@ -502,6 +531,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         relocalizationCount += 1
         anchorDriftAlarm = false
         anchorDriftMM = 0
+        positionIntegrityLost = false
         startSession(reset: true, preferSavedMap: true)
     }
 
@@ -568,15 +598,18 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         SimpleMaterial(color: UIColor.white.withAlphaComponent(0.98), roughness: 0.08, isMetallic: false)
     }
 
-    private func addMarkerEntity(_ marker: SavedMarker) {
+    private func addMarkerEntity(_ marker: SavedMarker, createSessionAnchor: Bool = true) {
         guard let arView else { return }
 
-        var transform = matrix_identity_float4x4
-        transform.columns.3 = SIMD4<Float>(marker.position.x, marker.position.y, marker.position.z, 1)
-        let sessionAnchor = ARAnchor(name: "PipePinService-\(marker.id.uuidString)", transform: transform)
-        arView.session.add(anchor: sessionAnchor)
-        serviceAnchors[marker.id] = sessionAnchor
+        if createSessionAnchor {
+            var transform = matrix_identity_float4x4
+            transform.columns.3 = SIMD4<Float>(marker.position.x, marker.position.y, marker.position.z, 1)
+            let sessionAnchor = ARAnchor(name: "PipePinService-\(marker.id.uuidString)", transform: transform)
+            arView.session.add(anchor: sessionAnchor)
+            serviceAnchors[marker.id] = sessionAnchor
+        }
         runtimeMarkerPositions[marker.id] = marker.position
+        lastObservedAnchorPositions[marker.id] = marker.position
 
         let anchor = AnchorEntity(world: marker.position)
         let solid = solidMaterial(for: marker.serviceType)
@@ -671,7 +704,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             return
         }
 
-        let targetPosition = runtimeMarkerPositions[marker.id] ?? marker.position
+        let targetPosition = marker.position
         let delta = targetPosition - currentPosition
         horizontalDistance = sqrt(delta.x * delta.x + delta.z * delta.z)
         verticalDifference = delta.y
@@ -695,6 +728,59 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         arView.scene.addAnchor(anchor)
         guideEntity = anchor
         guideMarkerID = marker.id
+    }
+
+    private func reticleWorldPosition(depth: Float, frame: ARFrame) -> SIMD3<Float>? {
+        guard let arView, depth.isFinite, depth > 0.10 else { return nil }
+        let centre = CGPoint(x: arView.bounds.midX, y: arView.bounds.midY)
+        guard let ray = arView.ray(through: centre) else { return nil }
+
+        let direction = simd_normalize(ray.direction)
+        let cameraForward4 = -frame.camera.transform.columns.2
+        let cameraForward = simd_normalize(SIMD3<Float>(cameraForward4.x, cameraForward4.y, cameraForward4.z))
+        let forwardComponent = max(0.20, simd_dot(direction, cameraForward))
+
+        // ARDepthData is Z-depth from the camera plane, not Euclidean range.
+        // Convert that Z-depth onto RealityKit's exact ray through the on-screen
+        // reticle. This makes placement share the same view geometry as the UI.
+        let range = depth / forwardComponent
+        let worldPoint = ray.origin + direction * range
+
+        if let projected = arView.project(worldPoint) {
+            let error = hypot(projected.x - centre.x, projected.y - centre.y)
+            aimErrorPixels = Int(error.rounded())
+        } else {
+            aimErrorPixels = nil
+        }
+        return worldPoint
+    }
+
+    private func updateAimPreview(_ position: SIMD3<Float>?) {
+        guard let arView else { return }
+        guard let position, precisionReady, !positionIntegrityLost else {
+            if let aimPreviewEntity { aimPreviewEntity.isEnabled = false }
+            return
+        }
+
+        if let aimPreviewEntity {
+            aimPreviewEntity.position = position
+            aimPreviewEntity.isEnabled = true
+            return
+        }
+
+        let anchor = AnchorEntity(world: position)
+        let outer = ModelEntity(
+            mesh: .generateSphere(radius: 0.034),
+            materials: [SimpleMaterial(color: UIColor.systemGreen.withAlphaComponent(0.34), roughness: 0.10, isMetallic: false)]
+        )
+        let centre = ModelEntity(
+            mesh: .generateSphere(radius: 0.014),
+            materials: [SimpleMaterial(color: .white, roughness: 0.08, isMetallic: false)]
+        )
+        anchor.addChild(outer)
+        anchor.addChild(centre)
+        arView.scene.addAnchor(anchor)
+        aimPreviewEntity = anchor
     }
 
     nonisolated private static func centreDepthSample(from frame: ARFrame) -> DepthFrameSample? {
@@ -742,30 +828,6 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         return DepthFrameSample(distance: values[values.count / 2], confidence: high.isEmpty ? 1 : 2)
     }
 
-    // ARDepthData stores depth along the camera Z axis. Convert the centre-image
-    // depth sample using the calibrated camera intrinsics rather than simply moving
-    // straight down camera.forward. The principal point is not guaranteed to be
-    // mathematically identical to the image centre, so this removes a real source
-    // of centimetre-scale aiming offset.
-    nonisolated private static func centreDepthWorldPosition(from frame: ARFrame, depth: Float) -> SIMD3<Float>? {
-        guard depth.isFinite, depth > 0.10 else { return nil }
-        let intrinsics = frame.camera.intrinsics
-        let resolution = frame.camera.imageResolution
-        let fx = intrinsics.columns.0.x
-        let fy = intrinsics.columns.1.y
-        let px = intrinsics.columns.2.x
-        let py = intrinsics.columns.2.y
-        guard fx > 0, fy > 0 else { return nil }
-
-        let u = Float(resolution.width) * 0.5
-        let v = Float(resolution.height) * 0.5
-        let cameraX = (u - px) / fx * depth
-        let cameraY = -(v - py) / fy * depth
-        let cameraPoint = SIMD4<Float>(cameraX, cameraY, -depth, 1)
-        let worldPoint = frame.camera.transform * cameraPoint
-        return SIMD3<Float>(worldPoint.x, worldPoint.y, worldPoint.z)
-    }
-
     nonisolated func session(_ session: ARSession, didUpdate frame: ARFrame) {
         let transform = frame.camera.transform
         let position = SIMD3<Float>(transform.columns.3.x, transform.columns.3.y, transform.columns.3.z)
@@ -775,7 +837,6 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
         let surfaceCount = frame.anchors.filter { $0 is ARMeshAnchor || $0 is ARPlaneAnchor }.count
         let light = frame.lightEstimate?.ambientIntensity ?? 1000
         let depthSample = Self.centreDepthSample(from: frame)
-        let depthWorldPosition = depthSample.flatMap { Self.centreDepthWorldPosition(from: frame, depth: $0.distance) }
         let anchorUpdates: [AnchorFrameUpdate] = frame.anchors.compactMap { anchor in
             guard let name = anchor.name, name.hasPrefix("PipePinService-") else { return nil }
             let uuidText = String(name.dropFirst("PipePinService-".count))
@@ -792,7 +853,14 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             let previousTimestamp = self.previousFrameTimestamp
             if let previousPosition, let previousTimestamp {
                 let dt = max(0.001, Float(timestamp - previousTimestamp))
-                self.motionSpeed = simd_distance(position, previousPosition) / dt
+                let frameStep = simd_distance(position, previousPosition)
+                self.motionSpeed = frameStep / dt
+                if frameStep > 0.30, !(self.isPrecisionCapturing) {
+                    self.positionIntegrityLost = true
+                    self.markersReliable = false
+                    self.setMarkerVisibility(false)
+                    self.statusText = "WORLD POSITION JUMP DETECTED · beams frozen. Re-lock before trusting positions."
+                }
             } else {
                 self.motionSpeed = 0
             }
@@ -804,28 +872,31 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             self.lowLight = light < 220
             self.depthDistance = depthSample?.distance
             self.depthConfidence = depthSample?.confidence ?? 0
+            let reticleWorldPosition = depthSample.flatMap { self.reticleWorldPosition(depth: $0.distance, frame: frame) }
 
             var maxDrift: Float = 0
             var suddenShift = false
             for update in anchorUpdates {
                 guard let saved = self.markerStore?.visibleMarkers.first(where: { $0.id == update.markerID }) else { continue }
-                let prior = self.runtimeMarkerPositions[update.markerID] ?? saved.position
-                let step = simd_distance(prior, update.position)
+                let priorObserved = self.lastObservedAnchorPositions[update.markerID] ?? saved.position
+                let step = simd_distance(priorObserved, update.position)
                 let total = simd_distance(saved.position, update.position)
                 maxDrift = max(maxDrift, total)
-                if step > 0.08 || total > 0.18 {
+                self.lastObservedAnchorPositions[update.markerID] = update.position
+
+                // Saved service coordinates are immutable. ARKit anchor refinements are
+                // diagnostic evidence only; never drag the visible beam to a new XYZ.
+                if step > 0.025 || total > 0.050 {
                     suddenShift = true
-                    continue
                 }
-                self.runtimeMarkerPositions[update.markerID] = update.position
-                self.markerEntities[update.markerID]?.position = update.position
             }
             self.anchorDriftMM = Int((maxDrift * 1000).rounded())
             if suddenShift {
                 self.anchorDriftAlarm = true
+                self.positionIntegrityLost = true
                 self.markersReliable = false
                 self.setMarkerVisibility(false)
-                self.statusText = "ANCHOR SHIFT DETECTED · beams hidden. Re-lock to the saved Site Map."
+                self.statusText = "POSITION SHIFT DETECTED · saved beams frozen and hidden. Re-lock to the Site Map."
             }
 
             switch mappingStatus {
@@ -873,7 +944,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
             self.precisionReady = trackingNormal && mappingUseful && depthUseful && lightUseful && motionUseful
             self.precisionText = self.precisionReady ? "PRECISION READY" : "SCANNING"
 
-            let reliableNow = trackingNormal && self.normalFrameStreak >= 5 && (!self.loadedSavedMapForSession || !self.wasRelocalizing) && !self.anchorDriftAlarm
+            let reliableNow = trackingNormal && (mappingStatus == .extending || mappingStatus == .mapped) && self.normalFrameStreak >= 12 && (!self.loadedSavedMapForSession || !self.wasRelocalizing) && !self.anchorDriftAlarm && !self.positionIntegrityLost
             if reliableNow != self.markersReliable {
                 self.markersReliable = reliableNow
                 self.setMarkerVisibility(reliableNow)
@@ -889,14 +960,15 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
                self.motionSpeed < 0.18,
                let depthSample,
                depthSample.confidence >= 1,
-               let depthWorldPosition {
-                self.captureSamples.append((depthWorldPosition, depthSample.confidence))
+               let reticleWorldPosition {
+                self.captureSamples.append((reticleWorldPosition, depthSample.confidence))
                 self.captureProgress = min(1, Double(self.captureSamples.count) / Double(self.requiredSamples))
                 if self.captureSamples.count >= self.requiredSamples {
                     self.finishPrecisionCapture()
                 }
             }
 
+            self.updateAimPreview(reticleWorldPosition)
             self.updateGuide()
         }
     }
@@ -904,6 +976,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     nonisolated func session(_ session: ARSession, didFailWithError error: Error) {
         let message = error.localizedDescription
         Task { @MainActor in
+            self.positionIntegrityLost = true
             self.markersReliable = false
             self.setMarkerVisibility(false)
             self.statusText = "AR session error · \(message)"
@@ -913,6 +986,7 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     nonisolated func sessionWasInterrupted(_ session: ARSession) {
         Task { @MainActor in
             self.interruptionCount += 1
+            self.positionIntegrityLost = true
             self.markersReliable = false
             self.setMarkerVisibility(false)
             self.statusText = "AR interrupted · precision beams hidden."
@@ -922,7 +996,8 @@ final class ARSessionController: NSObject, ObservableObject, ARSessionDelegate {
     nonisolated func sessionInterruptionEnded(_ session: ARSession) {
         Task { @MainActor in
             self.relocalizationCount += 1
-            self.statusText = "AR resumed · scan surroundings to relock position."
+            self.positionIntegrityLost = true
+            self.statusText = "AR resumed · position must be re-locked before beams are trusted."
             self.markersReliable = false
             self.normalFrameStreak = 0
         }
