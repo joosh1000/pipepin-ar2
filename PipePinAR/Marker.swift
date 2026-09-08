@@ -86,12 +86,14 @@ enum FlowDirection: String, Codable, CaseIterable, Identifiable {
 }
 
 enum PinSource: String, Codable {
+    case spatialMesh
     case lidarDepth
     case raycast
     case legacy
 
     var title: String {
         switch self {
+        case .spatialMesh: return "Spatial mesh"
         case .lidarDepth: return "LiDAR depth"
         case .raycast: return "AR raycast"
         case .legacy: return "Legacy pin"

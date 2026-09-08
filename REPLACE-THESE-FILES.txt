@@ -1,9 +1,13 @@
-PipePin 0.5.2 Ray-Lock + Frozen Coordinates
+PipePin 0.6 is intended to replace the whole cloned repo contents through GitHub Desktop.
 
-Copy EVERYTHING in this folder over the cloned pipepin-ar2 repository and choose Replace files in destination.
+New file in this build:
+- PipePinAR/SpatialMeshStore.swift
 
-Important changed files:
+Important changed files include:
 - PipePinAR/ARSessionController.swift
 - PipePinAR/ContentView.swift
+- PipePinAR/Marker.swift
 - project.yml
 - .github/workflows/build-unsigned-ipa.yml
+
+Copy EVERYTHING inside this folder over the local pipepin-ar2 repository, choose Replace files, then Commit + Push origin.

@@ -180,7 +180,7 @@ struct SitesHomeView: View {
                     Text("PIPEPIN")
                         .font(.system(size: 18, weight: .heavy, design: .rounded))
                         .tracking(2.0)
-                    Text("0.5.2")
+                    Text("0.6")
                         .font(.system(size: 8, weight: .heavy, design: .rounded))
                         .padding(.horizontal, 6)
                         .padding(.vertical, 3)
@@ -445,7 +445,7 @@ struct ARWorkspaceView: View {
                                 .lineLimit(1)
                             HStack(spacing: 5) {
                                 Text("PIPEPIN")
-                                Text("0.5.2")
+                                Text("0.6")
                             }
                             .font(.system(size: 8, weight: .heavy, design: .rounded))
                             .tracking(1.0)
@@ -457,11 +457,7 @@ struct ARWorkspaceView: View {
 
                 Spacer()
 
-                statusPill(
-                    title: arController.precisionText,
-                    icon: "scope",
-                    good: arController.precisionReady
-                )
+                trustPill
 
                 statusPill(
                     title: arController.lidarAvailable ? "LiDAR" : "AR",
@@ -530,6 +526,26 @@ struct ARWorkspaceView: View {
         }
     }
 
+    private var trustPill: some View {
+        let tint: Color = switch arController.positionTrust {
+        case .locked: .green
+        case .caution: .orange
+        case .lost: .red
+        }
+        return HStack(spacing: 5) {
+            Circle().fill(tint).frame(width: 6, height: 6)
+            Image(systemName: arController.positionTrust == .locked ? "lock.fill" : "location.viewfinder")
+                .font(.system(size: 10, weight: .bold))
+            Text(arController.positionTrust.rawValue)
+                .font(.system(size: 9, weight: .bold, design: .rounded))
+        }
+        .padding(.horizontal, 8)
+        .frame(height: 28)
+        .foregroundStyle(tint)
+        .background(.black.opacity(0.30), in: Capsule())
+        .overlay { Capsule().stroke(tint.opacity(0.35), lineWidth: 1) }
+    }
+
     private func statusPill(title: String, icon: String, good: Bool) -> some View {
         HStack(spacing: 5) {
             Circle()
@@ -575,15 +591,34 @@ struct ARWorkspaceView: View {
 
     @ViewBuilder
     private var targetHUD: some View {
-        if !arController.markersReliable && !markerStore.visibleMarkers.isEmpty {
+        if arController.positionTrust == .lost && !markerStore.visibleMarkers.isEmpty {
+            HStack(spacing: 10) {
+                Image(systemName: "exclamationmark.octagon.fill")
+                    .foregroundStyle(Color.red)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("POSITION LOST")
+                        .font(.system(size: 11, weight: .heavy, design: .rounded))
+                        .tracking(0.7)
+                    Text("A major coordinate shift was detected. Services are hidden until the saved Site Map is re-locked.")
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.62))
+                        .lineLimit(2)
+                }
+                Spacer()
+            }
+            .padding(12)
+            .background(Color.red.opacity(0.15), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 18).stroke(Color.red.opacity(0.38), lineWidth: 1) }
+            .padding(.bottom, 8)
+        } else if arController.positionTrust == .caution && !markerStore.visibleMarkers.isEmpty {
             HStack(spacing: 10) {
                 Image(systemName: "exclamationmark.triangle.fill")
                     .foregroundStyle(Color.orange)
                 VStack(alignment: .leading, spacing: 2) {
-                    Text("POSITION UNCERTAIN")
+                    Text("TRACKING CAUTION")
                         .font(.system(size: 11, weight: .heavy, design: .rounded))
                         .tracking(0.7)
-                    Text("Service beams are hidden until ARKit relocks. Scan the surroundings or use Re-lock in Precision & Mapping.")
+                    Text("Beams stay fixed and visible. Keep scanning the room as you move so PipePin can strengthen the site lock.")
                         .font(.system(size: 8, weight: .semibold, design: .rounded))
                         .foregroundStyle(.white.opacity(0.58))
                         .lineLimit(2)
@@ -591,11 +626,8 @@ struct ARWorkspaceView: View {
                 Spacer()
             }
             .padding(12)
-            .background(Color.orange.opacity(0.14), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
-            .overlay {
-                RoundedRectangle(cornerRadius: 18, style: .continuous)
-                    .stroke(Color.orange.opacity(0.34), lineWidth: 1)
-            }
+            .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
+            .overlay { RoundedRectangle(cornerRadius: 18).stroke(Color.orange.opacity(0.28), lineWidth: 1) }
             .padding(.bottom, 8)
         } else if let marker = markerStore.selectedMarker,
            let horizontal = arController.horizontalDistance,
@@ -615,19 +647,14 @@ struct ARWorkspaceView: View {
                     Text(marker.name.uppercased())
                         .font(.system(size: 12, weight: .heavy, design: .rounded))
                         .tracking(0.7)
-
                     HStack(spacing: 6) {
                         Label(marker.orientation.title, systemImage: marker.orientation.systemImage)
                         if marker.flowDirection != .none {
-                            Label(
-                                marker.flowDirection.title(for: marker.orientation),
-                                systemImage: marker.flowDirection.systemImage(for: marker.orientation)
-                            )
+                            Label(marker.flowDirection.title(for: marker.orientation), systemImage: marker.flowDirection.systemImage(for: marker.orientation))
                         }
                     }
                     .font(.system(size: 8, weight: .heavy, design: .rounded))
                     .foregroundStyle(marker.serviceType.tint)
-
                     Text(horizontal < 0.15 ? "ON ABOVE / BELOW TARGET" : "MOVE TO TARGET LINE")
                         .font(.system(size: 8, weight: .bold, design: .rounded))
                         .tracking(0.55)
@@ -643,10 +670,7 @@ struct ARWorkspaceView: View {
                         .font(.system(size: 9, weight: .bold, design: .rounded).monospacedDigit())
                         .tracking(0.3)
                         .foregroundStyle(.white.opacity(0.50))
-
-                    Button {
-                        arController.stopLocating()
-                    } label: {
+                    Button { arController.stopLocating() } label: {
                         Label("STOP LOCATE", systemImage: "xmark.circle.fill")
                             .font(.system(size: 8, weight: .heavy, design: .rounded))
                             .foregroundStyle(.white.opacity(0.72))
@@ -657,20 +681,107 @@ struct ARWorkspaceView: View {
             .padding(12)
             .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20, style: .continuous))
             .overlay(alignment: .leading) {
-                RoundedRectangle(cornerRadius: 2)
-                    .fill(marker.serviceType.tint)
-                    .frame(width: 4)
-                    .padding(.vertical, 10)
+                RoundedRectangle(cornerRadius: 2).fill(marker.serviceType.tint).frame(width: 4).padding(.vertical, 10)
             }
-            .overlay {
-                RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(marker.serviceType.tint.opacity(0.24), lineWidth: 1)
-            }
+            .overlay { RoundedRectangle(cornerRadius: 20).stroke(marker.serviceType.tint.opacity(0.24), lineWidth: 1) }
             .padding(.bottom, 8)
         }
     }
 
     private var controlDeck: some View {
+        VStack(spacing: 10) {
+            HStack(spacing: 7) {
+                ForEach(SpatialMode.allCases) { mode in
+                    Button { arController.setSpatialMode(mode) } label: {
+                        HStack(spacing: 6) {
+                            Image(systemName: mode == .map ? "cube.transparent" : (mode == .pin ? "scope" : "location.viewfinder"))
+                            Text(mode.title)
+                                .font(.system(size: 9, weight: .heavy, design: .rounded))
+                                .tracking(0.8)
+                        }
+                        .foregroundStyle(arController.spatialMode == mode ? Color.black : Color.white.opacity(0.68))
+                        .frame(maxWidth: .infinity)
+                        .frame(height: 34)
+                        .background(arController.spatialMode == mode ? Color.cyan : Color.black.opacity(0.28), in: Capsule())
+                        .overlay { Capsule().stroke(arController.spatialMode == mode ? Color.clear : .white.opacity(0.10), lineWidth: 1) }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+
+            if arController.spatialMode == .map {
+                mapModeDeck
+            } else if arController.spatialMode == .pin {
+                pinModeDeck
+            } else {
+                locateModeDeck
+            }
+        }
+        .padding(12)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 26, style: .continuous).stroke(.white.opacity(0.10), lineWidth: 1) }
+    }
+
+    private var mapModeDeck: some View {
+        VStack(spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("SPATIAL SITE MAP")
+                        .font(.system(size: 10, weight: .heavy, design: .rounded))
+                        .tracking(1.1)
+                    Text("Walk slowly and scan walls, floor, ceiling, doorways and stairs.")
+                        .font(.system(size: 8, weight: .semibold, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.50))
+                }
+                Spacer()
+                VStack(alignment: .trailing, spacing: 2) {
+                    Text("\(arController.mappedSurfaceCount)")
+                        .font(.system(size: 18, weight: .bold, design: .rounded).monospacedDigit())
+                    Text("MESH ANCHORS")
+                        .font(.system(size: 7, weight: .heavy, design: .rounded))
+                        .foregroundStyle(.white.opacity(0.42))
+                }
+            }
+
+            HStack(spacing: 10) {
+                Button { arController.setXRay(!arController.xrayVisible) } label: {
+                    deckWideButton(
+                        title: arController.xrayVisible ? "X-RAY ON" : "X-RAY OFF",
+                        subtitle: "Live LiDAR mesh",
+                        image: "cube.transparent",
+                        active: arController.xrayVisible
+                    )
+                }
+                .buttonStyle(.plain)
+
+                Button { arController.saveSpatialSiteMap() } label: {
+                    deckWideButton(
+                        title: "SAVE 3D MAP",
+                        subtitle: arController.hasSavedSpatialMesh ? "Update site model" : "Capture site model",
+                        image: "square.and.arrow.down",
+                        active: false
+                    )
+                }
+                .buttonStyle(.plain)
+            }
+
+            HStack(spacing: 8) {
+                Image(systemName: "camera.viewfinder")
+                Text("Map view \(arController.mappingLens.rawValue)")
+                Spacer()
+                if arController.ultraWideAvailable {
+                    Button("0.5×") { arController.setMappingLens(.ultraWide) }
+                    Button("1×") { arController.setMappingLens(.wide) }
+                    Button("AUTO") { arController.setMappingLens(.automatic) }
+                }
+            }
+            .font(.system(size: 8, weight: .heavy, design: .rounded))
+            .foregroundStyle(.white.opacity(0.60))
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var pinModeDeck: some View {
         VStack(spacing: 10) {
             HStack {
                 Text("SERVICE")
@@ -678,40 +789,29 @@ struct ARWorkspaceView: View {
                     .tracking(1.2)
                     .foregroundStyle(.white.opacity(0.44))
                 Spacer()
-                Text(selectedType.title.uppercased())
-                    .font(.system(size: 9, weight: .heavy, design: .rounded))
-                    .tracking(1.2)
-                    .foregroundStyle(selectedType.tint)
+                HStack(spacing: 5) {
+                    Circle().fill(arController.meshAimAvailable ? Color.green : Color.orange).frame(width: 6, height: 6)
+                    Text(arController.meshAimAvailable ? "MESH HIT" : "DEPTH FALLBACK")
+                        .font(.system(size: 8, weight: .heavy, design: .rounded))
+                }
+                .foregroundStyle(arController.meshAimAvailable ? Color.green : Color.orange)
             }
             .padding(.horizontal, 4)
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 8) {
                     ForEach(ServiceType.allCases) { type in
-                        Button {
-                            selectedType = type
-                        } label: {
+                        Button { selectedType = type } label: {
                             HStack(spacing: 7) {
-                                Image(systemName: type.systemImage)
-                                    .font(.system(size: 14, weight: .bold))
-                                Text(type.title)
-                                    .font(.system(size: 11, weight: .bold, design: .rounded))
+                                Image(systemName: type.systemImage).font(.system(size: 14, weight: .bold))
+                                Text(type.title).font(.system(size: 11, weight: .bold, design: .rounded))
                             }
                             .foregroundStyle(selectedType == type ? Color.black : type.tint)
                             .padding(.horizontal, 12)
                             .frame(height: 40)
-                            .background(
-                                selectedType == type ? type.tint : Color.black.opacity(0.34),
-                                in: Capsule()
-                            )
-                            .overlay {
-                                Capsule()
-                                    .stroke(type.tint.opacity(selectedType == type ? 0.0 : 0.34), lineWidth: 1)
-                            }
-                            .shadow(
-                                color: selectedType == type ? type.tint.opacity(0.38) : .clear,
-                                radius: 11
-                            )
+                            .background(selectedType == type ? type.tint : Color.black.opacity(0.34), in: Capsule())
+                            .overlay { Capsule().stroke(type.tint.opacity(selectedType == type ? 0.0 : 0.34), lineWidth: 1) }
+                            .shadow(color: selectedType == type ? type.tint.opacity(0.38) : .clear, radius: 11)
                         }
                         .buttonStyle(.plain)
                     }
@@ -720,39 +820,21 @@ struct ARWorkspaceView: View {
 
             HStack(spacing: 8) {
                 configLabel("RUN")
-                configButton(
-                    title: "Vertical",
-                    image: "arrow.up.and.down",
-                    active: selectedOrientation == .vertical
-                ) {
-                    selectedOrientation = .vertical
-                }
-                configButton(
-                    title: "Horizontal",
-                    image: "arrow.left.and.right",
-                    active: selectedOrientation == .horizontal
-                ) {
-                    selectedOrientation = .horizontal
-                }
+                configButton(title: "Vertical", image: "arrow.up.and.down", active: selectedOrientation == .vertical) { selectedOrientation = .vertical }
+                configButton(title: "Horizontal", image: "arrow.left.and.right", active: selectedOrientation == .horizontal) { selectedOrientation = .horizontal }
             }
 
             HStack(spacing: 8) {
                 configLabel("FLOW")
                 ForEach(FlowDirection.allCases) { direction in
-                    configButton(
-                        title: direction.title(for: selectedOrientation),
-                        image: direction.systemImage(for: selectedOrientation),
-                        active: selectedFlow == direction
-                    ) {
-                        selectedFlow = direction
-                    }
+                    configButton(title: direction.title(for: selectedOrientation), image: direction.systemImage(for: selectedOrientation), active: selectedFlow == direction) { selectedFlow = direction }
                 }
             }
 
             if selectedOrientation == .horizontal {
                 HStack(spacing: 6) {
                     Image(systemName: "iphone.gen3")
-                    Text("Horizontal beam follows the direction the rear camera is facing when you pin. Aim the phone along the service run, then press Pin Service.")
+                    Text("Aim the rear camera along the service run. The horizontal beam freezes to that world heading when pinned.")
                 }
                 .font(.system(size: 8, weight: .semibold, design: .rounded))
                 .foregroundStyle(.white.opacity(0.44))
@@ -760,61 +842,76 @@ struct ARWorkspaceView: View {
             }
 
             HStack(spacing: 10) {
-                Button {
-                    showPins = true
-                } label: {
-                    deckButton(title: "Pins", image: "mappin.and.ellipse")
-                }
-                .buttonStyle(.plain)
+                Button { showPins = true } label: { deckButton(title: "Pins", image: "mappin.and.ellipse") }
+                    .buttonStyle(.plain)
 
                 Button {
-                    arController.placeMarkerAtCenter(
-                        serviceType: selectedType,
-                        orientation: selectedOrientation,
-                        flowDirection: selectedFlow,
-                        area: selectedArea
-                    )
+                    arController.placeMarkerAtCenter(serviceType: selectedType, orientation: selectedOrientation, flowDirection: selectedFlow, area: selectedArea)
                 } label: {
                     HStack(spacing: 10) {
-                        Image(systemName: "plus")
-                            .font(.system(size: 18, weight: .heavy))
+                        Image(systemName: "plus").font(.system(size: 18, weight: .heavy))
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(arController.isPrecisionCapturing ? "HOLD STILL…" : "PRECISION PIN")
-                                .font(.system(size: 13, weight: .heavy, design: .rounded))
-                                .tracking(0.7)
+                            Text(arController.isPrecisionCapturing ? "HOLD STILL…" : "MESH-LOCK PIN")
+                                .font(.system(size: 13, weight: .heavy, design: .rounded)).tracking(0.7)
                             Text(arController.isPrecisionCapturing ? "CAPTURING \(Int(arController.captureProgress * 100))%" : pinSubtitle)
-                                .font(.system(size: 8, weight: .heavy, design: .rounded))
-                                .tracking(0.6)
-                                .lineLimit(1)
-                                .opacity(0.68)
+                                .font(.system(size: 8, weight: .heavy, design: .rounded)).tracking(0.6).lineLimit(1).opacity(0.68)
                         }
                         Spacer()
-                        Image(systemName: selectedOrientation.systemImage)
-                            .font(.system(size: 18, weight: .heavy))
+                        Image(systemName: selectedOrientation.systemImage).font(.system(size: 18, weight: .heavy))
                     }
                     .foregroundStyle(arController.precisionReady || arController.isPrecisionCapturing ? Color.black : Color.white.opacity(0.66))
                     .padding(.horizontal, 16)
-                    .frame(maxWidth: .infinity)
-                    .frame(height: 58)
+                    .frame(maxWidth: .infinity).frame(height: 58)
                     .background(arController.precisionReady || arController.isPrecisionCapturing ? selectedType.tint : Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 18, style: .continuous))
                     .shadow(color: arController.precisionReady ? selectedType.tint.opacity(0.42) : .clear, radius: 16, y: 6)
                 }
                 .buttonStyle(.plain)
 
-                Button {
-                    showScan = true
-                } label: {
-                    deckButton(title: "Scan", image: "move.3d")
-                }
-                .buttonStyle(.plain)
+                Button { showScan = true } label: { deckButton(title: "Tools", image: "slider.horizontal.3") }
+                    .buttonStyle(.plain)
             }
         }
-        .padding(12)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 26, style: .continuous))
-        .overlay {
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .stroke(.white.opacity(0.10), lineWidth: 1)
+    }
+
+    private var locateModeDeck: some View {
+        VStack(spacing: 10) {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("LOW-POWER LOCATE")
+                        .font(.system(size: 10, weight: .heavy, design: .rounded)).tracking(1.0)
+                    Text("LiDAR mesh/depth is backed off while you navigate to an existing service.")
+                        .font(.system(size: 8, weight: .semibold, design: .rounded)).foregroundStyle(.white.opacity(0.50))
+                }
+                Spacer()
+            }
+            HStack(spacing: 10) {
+                Button { showPins = true } label: {
+                    deckWideButton(title: "CHOOSE SERVICE", subtitle: "Open saved pins", image: "mappin.and.ellipse", active: true)
+                }
+                .buttonStyle(.plain)
+                Button { arController.relockToSavedMap() } label: {
+                    deckWideButton(title: "RE-LOCK", subtitle: "Saved site map", image: "scope", active: false)
+                }
+                .buttonStyle(.plain)
+                .disabled(!arController.hasSavedWorldMap)
+            }
         }
+    }
+
+    private func deckWideButton(title: String, subtitle: String, image: String, active: Bool) -> some View {
+        HStack(spacing: 9) {
+            Image(systemName: image).font(.system(size: 16, weight: .bold))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(title).font(.system(size: 9, weight: .heavy, design: .rounded)).tracking(0.5)
+                Text(subtitle).font(.system(size: 7, weight: .semibold, design: .rounded)).opacity(0.58)
+            }
+            Spacer(minLength: 0)
+        }
+        .foregroundStyle(active ? Color.black : Color.white)
+        .padding(.horizontal, 12)
+        .frame(maxWidth: .infinity).frame(height: 50)
+        .background(active ? Color.cyan : Color.black.opacity(0.32), in: RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .overlay { RoundedRectangle(cornerRadius: 16).stroke(active ? Color.clear : .white.opacity(0.10), lineWidth: 1) }
     }
 
     private var pinSubtitle: String {
@@ -902,6 +999,7 @@ struct PinsView: View {
                     Section("Saved services") {
                         ForEach(store.visibleMarkers) { marker in
                             Button {
+                                controller.setSpatialMode(.locate)
                                 controller.selectMarker(marker)
                                 dismiss()
                             } label: {
@@ -987,7 +1085,7 @@ struct ScanView: View {
                     LabeledContent("Precision", value: controller.precisionText)
                     LabeledContent("Tracking", value: controller.trackingText)
                     LabeledContent("World map", value: controller.mappingText)
-                    LabeledContent("Beams trustworthy", value: controller.markersReliable ? "Yes" : "Hidden / uncertain")
+                    LabeledContent("Position trust", value: controller.positionTrust.rawValue)
 
                     if controller.isPrecisionCapturing {
                         ProgressView(value: controller.captureProgress)
@@ -1003,6 +1101,7 @@ struct ScanView: View {
                     LabeledContent("Depth confidence", value: "\(controller.depthConfidence) / 2")
                     LabeledContent("Mapped surfaces", value: "\(controller.mappedSurfaceCount)")
                     LabeledContent("Last pin source", value: controller.lastPinSourceText)
+                    LabeledContent("Reticle mesh hit", value: controller.meshAimAvailable ? "Yes" : "No / fallback")
 
                     Button {
                         controller.toggleLiDARMesh()
@@ -1010,6 +1109,25 @@ struct ScanView: View {
                         Label(controller.lidarMeshVisible ? "Hide LiDAR mesh" : "Show LiDAR mesh", systemImage: "move.3d")
                     }
                     .disabled(!controller.lidarAvailable)
+                }
+
+                Section("Mapping camera") {
+                    Picker("Lens", selection: Binding(
+                        get: { controller.mappingLens },
+                        set: { controller.setMappingLens($0) }
+                    )) {
+                        ForEach(MappingLens.allCases) { lens in
+                            Text(lens.rawValue).tag(lens)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .disabled(!controller.ultraWideAvailable)
+
+                    Text(controller.ultraWideAvailable
+                         ? "0.5× is experimental for tight rooms and corridors so ARKit can see more surrounding geometry. PIN mode still prioritises the spatial mesh at the exact reticle."
+                         : "This AR configuration does not expose an ultra-wide format on this device, so PipePin stays on the supported camera view.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
                 }
 
                 Section("Light & movement") {
@@ -1027,21 +1145,27 @@ struct ScanView: View {
                     }
                     .pickerStyle(.segmented)
 
-                    Text("Auto uses the continuous rear torch when PipePin detects low light. LiDAR can still measure in darkness, but extra camera detail can help visual tracking and relocalisation.")
+                    Text("Auto waits for sustained darkness, then latches the continuous torch on so the camera light estimate cannot make it pulse on and off.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
 
-                Section("Saved Site Map") {
-                    LabeledContent("Saved map", value: controller.hasSavedWorldMap ? "Available" : "Not saved")
+                Section("Saved Spatial Site Map") {
+                    LabeledContent("Relocalisation map", value: controller.hasSavedWorldMap ? "Available" : "Not saved")
+                    LabeledContent("3D mesh snapshot", value: controller.hasSavedSpatialMesh ? "Available" : "Not saved")
+                    if controller.hasSavedSpatialMesh {
+                        LabeledContent("Mesh anchors", value: "\(controller.spatialMeshAnchorCount)")
+                        LabeledContent("Vertices", value: "\(controller.spatialMeshVertexCount)")
+                        LabeledContent("Faces", value: "\(controller.spatialMeshFaceCount)")
+                    }
                     if let mapSavedAt = controller.mapSavedAt {
                         LabeledContent("Saved", value: mapSavedAt.formatted(date: .abbreviated, time: .shortened))
                     }
 
                     Button {
-                        controller.saveSiteWorldMap()
+                        controller.saveSpatialSiteMap()
                     } label: {
-                        Label("Save / update Site Map", systemImage: "square.and.arrow.down")
+                        Label("Save / update 3D Site Map", systemImage: "square.and.arrow.down")
                     }
 
                     Button {
@@ -1051,7 +1175,7 @@ struct ScanView: View {
                     }
                     .disabled(!controller.hasSavedWorldMap)
 
-                    Text("If PipePin loses position between rooms, it now hides the beams instead of confidently showing a potentially wrong location. Re-lock loads the saved AR world map and waits for the environment to be recognised again.")
+                    Text("0.6 saves both the AR relocalisation map and a raw LiDAR mesh snapshot for this Site. CAUTION keeps fixed beams visible; only a major or sustained position loss hides them.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
@@ -1113,7 +1237,7 @@ struct ScanView: View {
                 }
 
                 Section {
-                    Text("PipePin 0.5.2 Ray-Lock. The priority of this build is reticle-true placement and immutable service coordinates.")
+                    Text("PipePin 0.6 Spatial Site Map. The LiDAR building mesh is now the primary service-placement surface and the foundation for the future 3D service model.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }
